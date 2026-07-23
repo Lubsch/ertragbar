@@ -1,0 +1,8 @@
+[package]
+name = "ertragbar"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+nanoserde = { version = "0.2.1", default-features = false, features = ["json"] }
