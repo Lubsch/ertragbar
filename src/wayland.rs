@@ -492,6 +492,14 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
                 app.bar.time = t;
                 app.dirty = true;
             }
+
+            // Also read battery by the minute (there's no events emited when charging)
+            uevent.drain();
+            let b = battery_src.read();
+            if b != app.bar.battery {
+                app.bar.battery = b;
+                app.dirty = true;
+            }
         }
 
         if fds[2].revents & libc::POLLIN != 0 {

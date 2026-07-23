@@ -13,6 +13,7 @@
               cargo
               rustc
               clippy
+              cargo-show-asm
             ];
           };
         }

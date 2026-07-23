@@ -143,9 +143,9 @@ impl Renderer {
 
     fn right_text(&self, bar: &Bar) -> String {
         let net = match bar.network {
-            Network::WifiConnected => "\u{f1eb}",    // nf-fa-wifi
-            Network::WifiDisconnected => "\u{f05aa}", // nf-md-wifi_off
-            Network::Ethernet => "\u{f0200}",         // nf-md-ethernet
+            Network::WifiConnected => "Wifi",    // nf-fa-wifi
+            Network::WifiDisconnected => "No Wifi :(", // nf-md-wifi_off
+            Network::Ethernet => "Ethernet",         // nf-md-ethernet
         };
         let bat = match bar.battery {
             Battery::None => String::new(),
