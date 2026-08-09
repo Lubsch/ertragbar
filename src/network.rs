@@ -8,8 +8,10 @@
 //! (non-link-local) address. Carrier alone goes up during association, before
 //! DHCP, which would show a connected icon while nothing actually works.
 
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
+
+use rustix::net;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Network {
@@ -139,36 +141,13 @@ const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 
 impl NetlinkSocket {
     pub fn new() -> anyhow::Result<Self> {
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_RAW | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                libc::NETLINK_ROUTE,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: socket() returned a fresh fd we now own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = net::socket_with(net::AddressFamily::NETLINK, net::SocketType::RAW, net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK, None)?;
 
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as u16;
-        addr.nl_pid = 0;
         // Link up/down, and v4/v6 address add/remove -- everything that can
         // change what `read()` would return.
-        addr.nl_groups = RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR;
+        let addr = net::netlink::SocketAddrNetlink::new(0, RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR);
+        net::bind(&fd, &addr)?;
 
-        let r = unsafe {
-            libc::bind(
-                fd.as_fd().as_raw_fd(),
-                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if r < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
         Ok(NetlinkSocket(fd))
     }
 

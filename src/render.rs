@@ -1,23 +1,14 @@
-//! Pure pixel rendering for the status bar.
-//!
-//! `Renderer` owns a font and a per-scale glyph cache. `draw` is a pure
-//! transform: given the current `Bar` and a target buffer, it paints ARGB8888
-//! pixels. Nothing here touches Wayland — you can dump the buffer to a PNG to
-//! test it (see the `dump_png` test-helper at the bottom).
-
 use std::collections::HashMap;
 use fontdue::Font;
 
-use crate::Bar; // your existing struct in main.rs
+use crate::Bar;
 use crate::battery::{Battery, Percentage};
 use crate::network::Network;
 use crate::tags::TagState;
 
-// ---- Logical layout constants (in logical px; multiplied by scale at runtime) ----
-
-pub const LOGICAL_HEIGHT: f64 = 22.0;
-const LOGICAL_FONT_PX: f64 = 14.0;
-const LOGICAL_PAD_X: f64 = 5.0; // left/right inner padding
+pub const LOGICAL_HEIGHT: f32 = 22.0;
+const LOGICAL_FONT_PX: f32 = 14.0;
+const LOGICAL_PAD_X: f32 = 5.0; // left/right inner padding
 
 // Colors, ARGB8888 (0xAARRGGBB). Opaque background + foreground.
 const BG: u32 = 0xff101010;
@@ -31,7 +22,7 @@ struct Glyph {
     height: usize,
     xmin: i32,     // offset from pen x to bitmap left
     ymin: i32,     // fontdue: offset of bitmap bottom from baseline
-    advance: f64,  // pen advance in physical px
+    advance: f32,  // pen advance in physical px
 }
 
 /// Physical-pixel metrics derived from a scale factor.
@@ -39,18 +30,18 @@ struct Glyph {
 pub struct Metrics {
     pub height: u32,   // physical bar height
     pub font_px: f32,  // physical font size for fontdue
-    pub pad_x: f64,
-    pub baseline: f64, // physical y of the text baseline
+    pub pad_x: f32,
+    pub baseline: f32, // physical y of the text baseline
 }
 
 impl Metrics {
-    pub fn new(scale: f64) -> Self {
+    pub fn new(scale: f32) -> Self {
         let height = (LOGICAL_HEIGHT * scale).round() as u32;
-        let scale = height as f64 / LOGICAL_HEIGHT; // effective scale, exact
-        let font_px = (LOGICAL_FONT_PX * scale) as f32;
+        let scale = height as f32 / LOGICAL_HEIGHT; // effective scale, exact
+        let font_px = LOGICAL_FONT_PX * scale;
         // Center text vertically: baseline ~ height*0.5 + font_px*0.35 is a
         // decent heuristic; refine with real font ascent if you want exactness.
-        let baseline = (height as f64) * 0.5 + (font_px as f64) * 0.35;
+        let baseline = (height as f32) * 0.5 + font_px * 0.35;
         Metrics {
             height,
             font_px,
@@ -64,8 +55,7 @@ use crate::gamma::GammaLut;
 
 pub struct Renderer {
     font: Font,
-    /// Glyph cache keyed by (char, font_px bits). Invalidated implicitly by key
-    /// change when scale changes.
+    /// Glyph cache keyed by (char, font_px bits)
     cache: HashMap<(char, u32), Glyph>,
     lut: GammaLut
 }
@@ -75,10 +65,8 @@ impl Renderer {
         self.cache.clear();
     }
 
-    /// Load from font bytes (e.g. a Nerd Font TTF you `include_bytes!` or read
-    /// at startup). Returns None if the font can't be parsed.
-    pub fn new(font: Font) -> anyhow::Result<Self> {
-        Ok(Renderer { font, cache: HashMap::new(), lut: GammaLut::new() })
+    pub fn new(font: Font) -> Self {
+        Renderer { font, cache: HashMap::new(), lut: GammaLut::new() }
     }
 
     fn glyph(&mut self, ch: char, font_px: f32) -> &Glyph {
@@ -91,13 +79,13 @@ impl Renderer {
                 height: m.height,
                 xmin: m.xmin,
                 ymin: m.ymin,
-                advance: m.advance_width as f64,
+                advance: m.advance_width,
             }
         })
     }
 
     /// Measure the advance width of a string in physical px (for right-aligning).
-    fn measure(&mut self, s: &str, font_px: f32) -> f64 {
+    fn measure(&mut self, s: &str, font_px: f32) -> f32 {
         s.chars().map(|c| self.glyph(c, font_px).advance).sum()
     }
 
@@ -113,7 +101,7 @@ impl Renderer {
         }
         // Left side: tags as full-height squares, first one flush to the left edge.
         let side = m.height as i32;   // square = bar height, exactly
-        let mut pen: f64 = 0.0;       // flush left, no pad
+        let mut pen: f32 = 0.0;       // flush left, no pad
 
         for (i, tag) in bar.tags.iter().enumerate() {
             let label = format!("{}", i + 1);
@@ -124,20 +112,20 @@ impl Renderer {
             };
 
             let x0 = pen.round() as i32;
-            fill_rect(buf, width, height, x0, 0, side, side, square);
+            fill_rect(buf, (width, height), (x0, 0), (side, side), square);
 
             // Center the digit inside the square.
             let tw = self.measure(&label, m.font_px);
-            let tx = pen + (side as f64 - tw) * 0.5;
+            let tx = pen + (side as f32 - tw) * 0.5;
             self.draw_text(&label, tx, text, m, buf, width, height);
 
-            pen += side as f64;   // squares touch; add a gap here if you want spacing
+            pen += side as f32;   // squares touch; add a gap here if you want spacing
         }
 
         // Right side: assemble the status string, right-align it.
         let right = self.right_text(bar);
         let text_w = self.measure(&right, m.font_px);
-        let start_x = (width as f64) - m.pad_x - text_w;
+        let start_x = (width as f32) - m.pad_x - text_w;
         self.draw_text(&right, start_x, FG, m, buf, width, height);
     }
 
@@ -162,13 +150,13 @@ impl Renderer {
     fn draw_text(
         &mut self,
         s: &str,
-        x: f64,
+        x: f32,
         color: u32,
         m: &Metrics,
         buf: &mut [u32],
         width: usize,
         height: usize,
-    ) -> f64 {
+    ) -> f32 {
         let mut pen = x;
         let baseline = m.baseline;
         for ch in s.chars() {
@@ -180,10 +168,10 @@ impl Renderer {
             let bitmap = g.bitmap.clone();
 
             // Top-left corner of the glyph bitmap in buffer coords.
-            let gx0 = (pen + gxmin as f64).round() as i32;
+            let gx0 = (pen + gxmin as f32).round() as i32;
             // fontdue's ymin is the offset of the bitmap's *bottom* above baseline;
             // top = baseline - (ymin + height).
-            let gy0 = (baseline - (gymin as f64 + gh as f64)).round() as i32;
+            let gy0 = (baseline - (gymin as f32 + gh as f32)).round() as i32;
 
             for row in 0..gh {
                 let py = gy0 + row as i32;
@@ -211,12 +199,9 @@ impl Renderer {
 
 fn fill_rect(
     buf: &mut [u32],
-    width: usize,
-    height: usize,
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
+    (width, height): (usize, usize),
+    (x, y): (i32, i32),
+    (w, h): (i32, i32),
     color: u32,
 ) {
     for row in 0..h {

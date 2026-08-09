@@ -16,6 +16,7 @@ use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use nanoserde::DeJson;
+use rustix::mm;
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
@@ -69,21 +70,13 @@ impl Buffers {
         let one = stride * height as usize;
         let map_len = one * 2;
 
-        let file = memfd(map_len)?;
+        let file = rustix::fs::memfd_create("statusbar", rustix::fs::MemfdFlags::CLOEXEC)?;
+        rustix::fs::ftruncate(&file, map_len as u64)?;
+
         // SAFETY: file is a fresh memfd of exactly map_len bytes.
         let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                map_len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_fd().as_raw_fd(),
-                0,
-            )
+            mm::mmap(std::ptr::null_mut(), map_len, mm::ProtFlags::READ | mm::ProtFlags::WRITE, mm::MapFlags::SHARED, &file, 0)?
         };
-        if map == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error().into());
-        }
 
         let pool = shm.create_pool(file.as_fd(), map_len as i32, qh, ());
         let mk = |idx: usize, offset: usize| Slot {
@@ -125,21 +118,9 @@ impl Drop for Buffers {
         }
         self.pool.destroy();
         // SAFETY: map/map_len came from mmap and are not used after this.
-        unsafe { libc::munmap(self.map as *mut libc::c_void, self.map_len) };
+        // Also ignore errors in drop function
+        let _ = unsafe { mm::munmap(self.map as *mut std::ffi::c_void, self.map_len) };
     }
-}
-
-fn memfd(size: usize) -> anyhow::Result<OwnedFd> {
-    let fd = unsafe { libc::memfd_create(c"statusbar".as_ptr(), libc::MFD_CLOEXEC) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    // SAFETY: memfd_create just returned this fd and nothing else owns it.
-    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    if unsafe { libc::ftruncate(fd.as_fd().as_raw_fd(), size as libc::off_t) } < 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(fd)
 }
 
 // ----------------------------------------------------------------- app state
@@ -170,16 +151,16 @@ pub struct App {
 }
 
 impl App {
-    fn scale(&self) -> f64 {
-        self.scale120 as f64 / 120.0
+    fn scale(&self) -> f32 {
+        self.scale120 as f32 / 120.0
     }
 
     /// Physical buffer size. Height comes from Metrics so renderer and buffer
     /// always agree on it.
     fn physical(&self) -> (u32, u32) {
         let m = Metrics::new(self.scale());
-        let eff = m.height as f64 / LOGICAL_HEIGHT;
-        let w = (self.logical_width as f64 * eff).round() as u32;
+        let eff = m.height as f32 / LOGICAL_HEIGHT;
+        let w = (self.logical_width as f32 * eff).round() as u32;
         (w.max(1), m.height.max(1))
     }
 
@@ -223,8 +204,8 @@ impl App {
         // the content non-uniformly and squares stop being square.
         if let Some(vp) = &self.viewport {
             // let s = self.scale();
-            let eff = ph as f64 / LOGICAL_HEIGHT;
-            let dw = ((pw as f64) / eff).round().max(1.0) as i32;
+            let eff = ph as f32 / LOGICAL_HEIGHT;
+            let dw = ((pw as f32) / eff).round().max(1.0) as i32;
             let dh = LOGICAL_HEIGHT as i32;
             vp.set_destination(dw, dh);
         }
@@ -357,6 +338,17 @@ ignore!(
 
 // ----------------------------------------------------------------------- run
 
+/// Read the expiration count to clear readability. ECANCELED means the clock was
+/// stepped (TFD_TIMER_CANCEL_ON_SET); we re-arm and repaint either way.
+fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
+    let mut buf = [0u8; 8];
+    match rustix::io::read(fd, &mut buf) {
+        Ok(_) | Err(rustix::io::Errno::CANCELED) => (),
+        Err(e) => anyhow::bail!(e),
+    }
+    Ok(())
+}
+
 pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue();
@@ -378,7 +370,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
         configured: false,
         dirty: true,
         buffers: None,
-        renderer: Renderer::new(font)?,
+        renderer: Renderer::new(font),
         bar: Bar {
             tags,
             network: Network::WifiDisconnected,
@@ -431,10 +423,14 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
         .spawn()?;
     let stdout = child.stdout.take().expect("piped");
     let mut tags_rd = std::io::BufReader::new(stdout);
+    // meh
+    let tags_rd_fd = unsafe { OwnedFd::from_raw_fd(tags_rd.get_ref().as_raw_fd()) };
 
     let battery_src = crate::battery::BatterySource::new();
     let uevent = crate::battery::UeventSocket::new()?;
+    let uevent_fd = uevent.as_fd();
     let netlink = crate::network::NetlinkSocket::new()?;
+    let netlink_fd = netlink.as_fd();
 
     // Initial state.
     app.bar.battery = battery_src.read();
@@ -457,30 +453,23 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
         };
 
         let mut fds = [
-            pollfd(conn.as_fd()),
-            pollfd(timer.as_fd()),
-            pollfd(tags_rd.get_ref().as_fd()),
-            pollfd(uevent.as_fd()),
-            pollfd(netlink.as_fd()),
+            rustix::event::PollFd::new(&conn, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::new(&timer, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::new(&tags_rd_fd, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::new(&uevent_fd, rustix::event::PollFlags::IN),
+            rustix::event::PollFd::new(&netlink_fd, rustix::event::PollFlags::IN),
         ];
-        let n = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
-            drop(guard);
-            if e.raw_os_error() == Some(libc::EINTR) {
-                continue;
-            }
-            return Err(e.into());
-        }
 
-        if fds[0].revents & libc::POLLIN != 0 {
+        rustix::event::poll(&mut fds, None)?;
+
+        if fds[0].revents().contains(rustix::event::PollFlags::IN) {
             guard.read()?;
         } else {
             drop(guard);
         }
         queue.dispatch_pending(&mut app)?;
 
-        if fds[1].revents & libc::POLLIN != 0 {
+        if fds[1].revents().contains(rustix::event::PollFlags::IN) {
             drain_timer(timer.as_fd())?;
             while let Err(e) = crate::time::arm_next_minute(&timer) {
                 eprintln!("Error setting timer: {e}");
@@ -502,7 +491,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[2].revents & libc::POLLIN != 0 {
+        if fds[2].revents().contains(rustix::event::PollFlags::IN) {
             // A tag switch can emit several lines at once. Drain everything
             // buffered and keep only the last, so a burst costs one paint.
             let mut latest: Option<[TagState; 9]> = None;
@@ -529,7 +518,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[3].revents & libc::POLLIN != 0 {
+        if fds[3].revents().contains(rustix::event::PollFlags::IN) {
             uevent.drain();
             let b = battery_src.read();
             if b != app.bar.battery {
@@ -538,7 +527,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[4].revents & libc::POLLIN != 0 {
+        if fds[4].revents().contains(rustix::event::PollFlags::IN) {
             netlink.drain();
             let n = crate::network::read();
             if n != app.bar.network {
@@ -553,24 +542,5 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
     }
 
     let _ = child.kill();
-    Ok(())
-}
-
-fn pollfd(fd: BorrowedFd<'_>) -> libc::pollfd {
-    libc::pollfd { fd: fd.as_raw_fd(), events: libc::POLLIN, revents: 0 }
-}
-
-/// Read the expiration count to clear readability. ECANCELED means the clock was
-/// stepped (TFD_TIMER_CANCEL_ON_SET); we re-arm and repaint either way.
-fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
-    let mut buf = [0u8; 8];
-    let n = unsafe { libc::read(fd.as_raw_fd(), buf.as_mut_ptr().cast(), buf.len()) };
-    if n < 0 {
-        let e = std::io::Error::last_os_error();
-        return match e.raw_os_error() {
-            Some(libc::ECANCELED) | Some(libc::EAGAIN) => Ok(()),
-            _ => Err(e.into()),
-        };
-    }
     Ok(())
 }

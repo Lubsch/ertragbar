@@ -4,8 +4,10 @@
 //! parse the message, we just drain it and re-read sysfs. Battery events are
 //! rare, sysfs reads are cheap, and this avoids all uevent parsing.
 
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
+
+use rustix::net;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Percentage(pub u8);
@@ -91,43 +93,17 @@ impl Default for BatterySource {
     }
 }
 
-// ------------------------------------------------------------ udev netlink
-
 /// A netlink socket bound to the kernel's uevent multicast group. Readable
 /// whenever any device changes; we don't parse the payload.
 pub struct UeventSocket(OwnedFd);
 
 impl UeventSocket {
     pub fn new() -> anyhow::Result<Self> {
-        // NETLINK_KOBJECT_UEVENT carries kernel device events.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_NETLINK,
-                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
-                libc::NETLINK_KOBJECT_UEVENT,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        // SAFETY: socket() returned a fresh fd we now own.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+        let fd = net::socket_with(net::AddressFamily::NETLINK, net::SocketType::DGRAM, net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK, Some(net::netlink::KOBJECT_UEVENT))?;
 
-        let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-        addr.nl_family = libc::AF_NETLINK as u16;
-        addr.nl_pid = 0; // let the kernel assign
-        addr.nl_groups = 1; // group 1 == kernel uevents
+        let addr = net::netlink::SocketAddrNetlink::new(0, 1);
+        net::bind(&fd, &addr)?;
 
-        let r = unsafe {
-            libc::bind(
-                fd.as_fd().as_raw_fd(),
-                &addr as *const libc::sockaddr_nl as *const libc::sockaddr,
-                std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-            )
-        };
-        if r < 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
         Ok(UeventSocket(fd))
     }
 
@@ -146,21 +122,10 @@ impl UeventSocket {
 pub(crate) fn drain_socket(fd: std::os::fd::BorrowedFd<'_>) -> bool {
     let mut buf = [0u8; 4096];
     let mut got = false;
-    loop {
-        let n = unsafe {
-            libc::recv(
-                fd.as_raw_fd(),
-                buf.as_mut_ptr().cast(),
-                buf.len(),
-                libc::MSG_DONTWAIT,
-            )
-        };
+    while let Ok((n, _)) = net::recv(fd, &mut buf, net::RecvFlags::DONTWAIT) {
         if n > 0 {
             got = true;
-            continue; // keep draining; several events can be queued
         }
-        // n == 0 or EAGAIN/EWOULDBLOCK: nothing left. Any other error we also
-        // treat as "stop reading" -- a bar shouldn't die over a netlink hiccup.
-        return got;
     }
+    got
 }

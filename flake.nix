@@ -14,6 +14,7 @@
               rustc
               clippy
               cargo-show-asm
+              cargo-bloat
             ];
           };
         }

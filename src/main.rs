@@ -19,11 +19,8 @@ struct Bar {
 mod wayland;
 
 fn main() -> anyhow::Result<()> {
-    let font = std::fs::read("/nix/store/b47vj9qv7rx6g72hcpdkpvf43gjrnvfj-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf")?;
-    let start = std::time::Instant::now();
+    let font = std::fs::read("/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf")?;
     let font = fontdue::Font::from_bytes(font.as_slice(), fontdue::FontSettings::default())
         .map_err(|e| anyhow::anyhow!("font parse: {e}"))?;
-    let end = std::time::Instant::now();
-    dbg!(end-start);
     wayland::run(font)
 }
