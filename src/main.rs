@@ -1,5 +1,5 @@
 use std::io::BufRead;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use nanoserde::DeJson;
 use rustix::{event, mm};
@@ -25,14 +25,13 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-use crate::{battery::Battery, network::Network, render::{LOGICAL_HEIGHT, Metrics, Renderer}, tags::TagState, time::Time};
+use crate::{battery::Battery, network::Network, render::{LOGICAL_HEIGHT, Renderer}, tags::TagState, time::Time};
 
 mod tags;
 mod network;
 mod battery;
 mod time;
 mod render;
-mod gamma;
 mod socket;
 
 #[derive(Debug)]
@@ -53,8 +52,8 @@ struct Buffers {
     /// mmap covering both buffers; valid for the life of this struct.
     map: *mut u8,
     map_len: usize,
-    width: u32,
-    height: u32,
+    width: i32,
+    height: i32,
     slots: [Slot; 2],
 }
 
@@ -65,7 +64,7 @@ struct Slot {
 }
 
 impl Buffers {
-    fn new(shm: &WlShm, qh: &QueueHandle<App>, width: u32, height: u32) -> anyhow::Result<Self> {
+    fn new(shm: &WlShm, qh: &QueueHandle<App>, width: i32, height: i32) -> anyhow::Result<Self> {
         let stride = width as usize * 4;
         let one = stride * height as usize;
         let map_len = one * 2;
@@ -151,24 +150,11 @@ pub struct App {
 }
 
 impl App {
-    fn scale(&self) -> f32 {
-        self.scale120 as f32 / 120.0
-    }
-
-    /// Physical buffer size. Height comes from Metrics so renderer and buffer
-    /// always agree on it.
-    fn physical(&self) -> (u32, u32) {
-        let m = Metrics::new(self.scale());
-        let eff = m.height as f32 / LOGICAL_HEIGHT;
-        let w = (self.logical_width as f32 * eff).round() as u32;
-        (w.max(1), m.height.max(1))
-    }
-
     fn paint(&mut self, qh: &QueueHandle<App>) -> anyhow::Result<()> {
         if !self.configured || self.logical_width == 0 {
             return Ok(());
         }
-        let (pw, ph) = self.physical();
+        let render::Layout { phys_width: pw, phys_height: ph, .. } = *self.renderer.layout();
 
         // Reallocate only when the physical size actually changed.
         let stale = match &self.buffers {
@@ -191,23 +177,14 @@ impl App {
         // Render. Split the field borrows so `renderer` and `buffers` can both be
         // borrowed mutably at once; the scope ends before we touch `self` again.
         {
-            let m = Metrics::new(self.scale());
             let App { buffers, renderer, bar, .. } = self;
             let bufs = buffers.as_mut().expect("checked above");
-            renderer.draw(bar, &m, bufs.pixels(idx), pw);
+            renderer.draw(bar, bufs.pixels(idx), pw);
         }
 
         let surface = self.surface.as_ref().expect("surface");
-        // The viewport maps the physical buffer to a logical size. Derive that
-        // size from the *actual* physical size, so the ratio is exact: rounding
-        // width and height independently against the logical constants stretches
-        // the content non-uniformly and squares stop being square.
         if let Some(vp) = &self.viewport {
-            // let s = self.scale();
-            let eff = ph as f32 / LOGICAL_HEIGHT;
-            let dw = ((pw as f32) / eff).round().max(1.0) as i32;
-            let dh = LOGICAL_HEIGHT as i32;
-            vp.set_destination(dw, dh);
+            vp.set_destination(self.renderer.layout().dest_width as i32, LOGICAL_HEIGHT as i32);
         }
         let bufs = self.buffers.as_ref().expect("checked above");
         surface.attach(Some(&bufs.slots[idx].buffer), 0, 0);
@@ -273,6 +250,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for App {
                 layer.ack_configure(serial);
                 if width > 0 && width != state.logical_width {
                     state.logical_width = width;
+                    state.renderer.rescale(state.scale120 as i32, state.logical_width as i32);
                     state.dirty = true;
                 }
                 if !state.configured {
@@ -298,7 +276,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event && scale != 0 && scale != state.scale120 {
             state.scale120 = scale;
-            state.renderer.clear_cache(); // glyph pixel size changed
+            state.renderer.rescale(scale as i32, state.logical_width as i32);
             state.dirty = true;
         }
     }
@@ -424,8 +402,7 @@ fn main() -> anyhow::Result<()> {
         .spawn()?;
     let stdout = child.stdout.take().unwrap();
     let mut tags_rd = std::io::BufReader::new(stdout);
-    // meh
-    let tags_rd_fd = unsafe { OwnedFd::from_raw_fd(tags_rd.get_ref().as_raw_fd()) };
+    let tags_rd_raw = tags_rd.get_ref().as_raw_fd();
 
     let battery_path = battery::battery_path();
     let uevent = battery::UeventSocket::new()?;
@@ -456,7 +433,7 @@ fn main() -> anyhow::Result<()> {
         let mut fds = [
             event::PollFd::new(&conn, event::PollFlags::IN),
             event::PollFd::new(&timer, event::PollFlags::IN),
-            event::PollFd::new(&tags_rd_fd, event::PollFlags::IN),
+            event::PollFd::from_borrowed_fd(unsafe { BorrowedFd::borrow_raw(tags_rd_raw) }, event::PollFlags::IN),
             event::PollFd::new(&uevent_fd, event::PollFlags::IN),
             event::PollFd::new(&netlink_fd, event::PollFlags::IN),
         ];

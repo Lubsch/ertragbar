@@ -6,9 +6,9 @@ use crate::battery::{Battery, Percentage};
 use crate::network::Network;
 use crate::tags::TagState;
 
-pub const LOGICAL_HEIGHT: f32 = 22.0;
-const LOGICAL_FONT_PX: f32 = 14.0;
-const LOGICAL_PAD_X: f32 = 5.0; // left/right inner padding
+pub const LOGICAL_HEIGHT: i32 = 22;
+const LOGICAL_FONT_PX: i32 = 14;
+const LOGICAL_PAD_X: i32 = 5; // left/right inner padding
 
 // Colors, ARGB8888 (0xAARRGGBB). Opaque background + foreground.
 const BG: u32 = 0xff101010;
@@ -25,54 +25,57 @@ struct Glyph {
     advance: f32,  // pen advance in physical px
 }
 
-/// Physical-pixel metrics derived from a scale factor.
-#[derive(Clone, Copy)]
-pub struct Metrics {
-    pub height: u32,   // physical bar height
-    pub font_px: f32,  // physical font size for fontdue
-    pub pad_x: f32,
-    pub baseline: f32, // physical y of the text baseline
+#[derive(Default)]
+pub struct Layout {
+    pub phys_width: i32,
+    pub phys_height: i32,
+    pub dest_width: i32,
+    pub pad_x: i32,
+    pub baseline: i32
 }
-
-impl Metrics {
-    pub fn new(scale: f32) -> Self {
-        let height = (LOGICAL_HEIGHT * scale).round() as u32;
-        let scale = height as f32 / LOGICAL_HEIGHT; // effective scale, exact
-        let font_px = LOGICAL_FONT_PX * scale;
-        // Center text vertically: baseline ~ height*0.5 + font_px*0.35 is a
-        // decent heuristic; refine with real font ascent if you want exactness.
-        let baseline = (height as f32) * 0.5 + font_px * 0.35;
-        Metrics {
-            height,
-            font_px,
-            pad_x: LOGICAL_PAD_X * scale,
-            baseline,
-        }
-    }
-}
-
-use crate::gamma::GammaLut;
 
 pub struct Renderer {
     font: Font,
+    font_px: f32,
     /// Glyph cache keyed by (char, font_px bits)
-    cache: HashMap<(char, u32), Glyph>,
-    lut: GammaLut
+    cache: HashMap<char, Glyph>,
+    layout: Layout
 }
 
 impl Renderer {
-    pub fn clear_cache(&mut self) {
-        self.cache.clear();
-    }
-
     pub fn new(font: Font) -> Self {
-        Renderer { font, cache: HashMap::new(), lut: GammaLut::new() }
+        let mut r = Renderer { font, cache: HashMap::new(), font_px: LOGICAL_FONT_PX as f32, layout: Layout::default() };
+        r.rescale(120, 1920);
+        r
     }
 
-    fn glyph(&mut self, ch: char, font_px: f32) -> &Glyph {
-        let key = (ch, font_px.to_bits());
-        self.cache.entry(key).or_insert_with(|| {
-            let (m, bitmap) = self.font.rasterize(ch, font_px);
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    pub fn rescale(&mut self, scale120: i32, logical_width: i32) {
+        let phys_height = (LOGICAL_HEIGHT * scale120 + 60) / 120;
+        let phys_width  = (logical_width  * scale120 + 60) / 120;
+
+        self.font_px = LOGICAL_FONT_PX as f32 * phys_height as f32 / LOGICAL_HEIGHT as f32;
+
+        let lm = self.font.horizontal_line_metrics(self.font_px).unwrap();
+        let baseline = ((phys_height as f32 - (lm.ascent - lm.descent)) * 0.5 + lm.ascent).round() as i32;
+
+        self.cache.clear();
+
+        self.layout = Layout {
+            phys_height,
+            phys_width,
+            dest_width: (phys_width * LOGICAL_HEIGHT + phys_height / 2) / phys_height,
+            pad_x: (LOGICAL_PAD_X * phys_height + LOGICAL_HEIGHT / 2) / LOGICAL_HEIGHT,
+            baseline
+        };
+    }
+
+    fn glyph(&mut self, ch: char) -> &Glyph {
+        self.cache.entry(ch).or_insert_with(|| {
+            let (m, bitmap) = self.font.rasterize(ch, self.font_px);
             Glyph {
                 bitmap,
                 width: m.width,
@@ -85,14 +88,14 @@ impl Renderer {
     }
 
     /// Measure the advance width of a string in physical px (for right-aligning).
-    fn measure(&mut self, s: &str, font_px: f32) -> f32 {
-        s.chars().map(|c| self.glyph(c, font_px).advance).sum()
+    fn measure(&mut self, s: &str) -> f32 {
+        s.chars().map(|c| self.glyph(c).advance).sum()
     }
 
     /// Paint `bar` into `buf` (len must be width*height, ARGB8888 physical px).
-    pub fn draw(&mut self, bar: &Bar, m: &Metrics, buf: &mut [u32], width: u32) {
+    pub fn draw(&mut self, bar: &Bar, buf: &mut [u32], width: i32) {
         let width = width as usize;
-        let height = m.height as usize;
+        let height = self.layout.phys_height as usize;
         assert_eq!(buf.len(), width * height, "buffer size mismatch");
 
         // Background fill.
@@ -100,7 +103,7 @@ impl Renderer {
             *px = BG;
         }
         // Left side: tags as full-height squares, first one flush to the left edge.
-        let side = m.height as i32;   // square = bar height, exactly
+        let side = self.layout.phys_height;   // square = bar height, exactly
         let mut pen: f32 = 0.0;       // flush left, no pad
 
         for (i, tag) in bar.tags.iter().enumerate() {
@@ -115,18 +118,18 @@ impl Renderer {
             fill_rect(buf, (width, height), (x0, 0), (side, side), square);
 
             // Center the digit inside the square.
-            let tw = self.measure(&label, m.font_px);
+            let tw = self.measure(&label);
             let tx = pen + (side as f32 - tw) * 0.5;
-            self.draw_text(&label, tx, text, m, buf, width, height);
+            self.draw_text(&label, tx, text, buf, width, height);
 
             pen += side as f32;   // squares touch; add a gap here if you want spacing
         }
 
         // Right side: assemble the status string, right-align it.
         let right = self.right_text(bar);
-        let text_w = self.measure(&right, m.font_px);
-        let start_x = (width as f32) - m.pad_x - text_w;
-        self.draw_text(&right, start_x, FG, m, buf, width, height);
+        let text_w = self.measure(&right);
+        let start_x = (width as f32) - self.layout.pad_x as f32 - text_w;
+        self.draw_text(&right, start_x, FG, buf, width, height);
     }
 
     fn right_text(&self, bar: &Bar) -> String {
@@ -152,26 +155,25 @@ impl Renderer {
         s: &str,
         x: f32,
         color: u32,
-        m: &Metrics,
         buf: &mut [u32],
         width: usize,
         height: usize,
     ) -> f32 {
         let mut pen = x;
-        let baseline = m.baseline;
+        let baseline = self.layout.baseline;
         for ch in s.chars() {
             // Copy the glyph out of the cache to avoid borrowing self across the
             // blit loop.
-            let g = self.glyph(ch, m.font_px);
+            let g = self.glyph(ch);
             let (gw, gh, gxmin, gymin) = (g.width, g.height, g.xmin, g.ymin);
             let advance = g.advance;
-            let bitmap = g.bitmap.clone();
+            let bitmap = &g.bitmap;
 
             // Top-left corner of the glyph bitmap in buffer coords.
             let gx0 = (pen + gxmin as f32).round() as i32;
             // fontdue's ymin is the offset of the bitmap's *bottom* above baseline;
             // top = baseline - (ymin + height).
-            let gy0 = (baseline - (gymin as f32 + gh as f32)).round() as i32;
+            let gy0 = baseline - gymin - gh as i32;
 
             for row in 0..gh {
                 let py = gy0 + row as i32;
@@ -183,12 +185,23 @@ impl Renderer {
                     if px < 0 || px >= width as i32 {
                         continue;
                     }
-                    let cov = bitmap[row * gw + col];
+                    let cov = bitmap[row * gw + col] as u32;
                     if cov == 0 {
                         continue;
                     }
                     let idx = py as usize * width + px as usize;
-                    buf[idx] = self.lut.blend(buf[idx], color, cov);
+                    let bg = buf[idx];
+                    if cov == 255 {
+                        buf[idx] = color;
+                        continue;
+                    }
+                    let inv = 255 - cov;
+                    let ch = |shift: u32| -> u32 {
+                        let fg_c = (color >> shift) & 0xff;
+                        let bg_c = (bg >> shift) & 0xff;
+                        (fg_c * cov + bg_c * inv + 127) / 255
+                    };
+                    buf[idx] = 0xff00_0000 | (ch(16) << 16) | (ch(8) << 8) | ch(0);
                 }
             }
             pen += advance;
