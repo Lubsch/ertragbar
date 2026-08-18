@@ -70,7 +70,7 @@ impl Buffers {
         let one = stride * height as usize;
         let map_len = one * 2;
 
-        let file = rustix::fs::memfd_create("statusbar", rustix::fs::MemfdFlags::CLOEXEC)?;
+        let file = rustix::fs::memfd_create("ertragbar", rustix::fs::MemfdFlags::CLOEXEC)?;
         rustix::fs::ftruncate(&file, map_len as u64)?;
 
         // SAFETY: file is a fresh memfd of exactly map_len bytes.
@@ -396,7 +396,7 @@ fn main() -> anyhow::Result<()> {
         &surface,
         None, // compositor picks the output
         zwlr_layer_shell_v1::Layer::Top,
-        "statusbar".into(),
+        "ertragbar".to_string(),
         &qh,
         (),
     );
@@ -422,7 +422,7 @@ fn main() -> anyhow::Result<()> {
         .args(["watch", "all-tags"])
         .stdout(std::process::Stdio::piped())
         .spawn()?;
-    let stdout = child.stdout.take().expect("piped");
+    let stdout = child.stdout.take().unwrap();
     let mut tags_rd = std::io::BufReader::new(stdout);
     // meh
     let tags_rd_fd = unsafe { OwnedFd::from_raw_fd(tags_rd.get_ref().as_raw_fd()) };
