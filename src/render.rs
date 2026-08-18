@@ -137,12 +137,12 @@ impl Renderer {
         };
         let bat = match bar.battery {
             Battery::None => String::new(),
-            Battery::Charging(Percentage(p)) => format!("{p}% \u{25b2}   "),
-            Battery::Discharging(Percentage(p)) => format!("{p}% \u{25bc}   "),
+            Battery::Charging(Percentage(p)) => format!("{p}% ▲   "),
+            Battery::Discharging(Percentage(p)) => format!("{p}% ▼   "),
+            Battery::Unknown(Percentage(p)) => format!("{p}% —   ")
         };
-        let crate::time::Date(y, mo, d) = bar.date;
-        let crate::time::Time(h, mi) = bar.time;
-        format!("{net}   {bat}{y:04}-{mo:02}-{d:02} {h:02}:{mi:02}")
+        let crate::time::Time { year, month, day, hour, minute } = bar.time;
+        format!("{net}   {bat}{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
     }
 
     /// Draw a run of text starting at pen x = `x`, baseline from `m`. Returns the

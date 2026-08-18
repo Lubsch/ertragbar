@@ -17,6 +17,7 @@ pub enum Battery {
     None,
     Charging(Percentage),
     Discharging(Percentage),
+    Unknown(Percentage)
 }
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
@@ -24,7 +25,7 @@ const POWER_SUPPLY: &str = "/sys/class/power_supply";
 /// Find the first real battery. Power supplies also include AC adapters and
 /// peripheral batteries (mice, headsets); we want `type == Battery` and skip
 /// anything scoped as a Device rather than the system battery.
-fn battery_path() -> Option<PathBuf> {
+pub fn battery_path() -> Option<PathBuf> {
     let entries = std::fs::read_dir(POWER_SUPPLY).ok()?;
     for e in entries.flatten() {
         let p = e.path();
@@ -46,7 +47,7 @@ fn read_trimmed(p: &Path) -> Option<String> {
 
 /// Read current battery state. Returns NoBattery on a desktop or if sysfs is
 /// missing/unreadable -- a status bar should degrade quietly, not error out.
-pub fn read(path: Option<&Path>) -> Battery {
+pub fn read(path: &Option<PathBuf>) -> Battery {
     let Some(p) = path else {
         return Battery::None;
     };
@@ -67,29 +68,8 @@ pub fn read(path: Option<&Path>) -> Battery {
         Some("Full") => Battery::Charging(Percentage(pct)),
         // "Not charging" means plugged in but held (charge thresholds), which
         // is closer to charging than draining.
-        Some("Not charging") => Battery::Charging(Percentage(pct)),
-        _ => Battery::Discharging(Percentage(pct)),
-    }
-}
-
-/// Cached battery location so we don't re-scan the directory on every update.
-pub struct BatterySource {
-    path: Option<PathBuf>,
-}
-
-impl BatterySource {
-    pub fn new() -> Self {
-        BatterySource { path: battery_path() }
-    }
-
-    pub fn read(&self) -> Battery {
-        read(self.path.as_deref())
-    }
-}
-
-impl Default for BatterySource {
-    fn default() -> Self {
-        Self::new()
+        Some("Discharging") => Battery::Discharging(Percentage(pct)),
+        _ => Battery::Unknown(Percentage(pct)),
     }
 }
 
