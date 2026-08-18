@@ -47,7 +47,7 @@ struct Bar {
 /// A memfd-backed pool holding exactly two buffers we alternate between.
 /// `busy` marks one the compositor still holds.
 struct Buffers {
-    file: OwnedFd,
+    _file: OwnedFd,
     pool: WlShmPool,
     /// mmap covering both buffers; valid for the life of this struct.
     map: *mut u8,
@@ -93,7 +93,7 @@ impl Buffers {
         };
         let slots = [mk(0, 0), mk(1, one)];
 
-        Ok(Buffers { file, pool, map: map as *mut u8, map_len, width, height, slots })
+        Ok(Buffers { _file: file, pool, map: map as *mut u8, map_len, width, height, slots })
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -143,14 +143,15 @@ pub struct App {
     dirty: bool,
 
     buffers: Option<Buffers>,
-    renderer: Result<Renderer, fontdue::Font>,
+    renderer: Option<Renderer>,
+    font: Option<fontdue::Font>,
     bar: Bar,
     exit: bool,
 }
 
 impl App {
     fn paint(&mut self, qh: &QueueHandle<App>) -> anyhow::Result<()> {
-        let Ok(renderer) = self.renderer.as_mut() else {
+        let Some(renderer) = self.renderer.as_mut() else {
             return Ok(())
         };
 
@@ -243,22 +244,11 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for App {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, width, .. } => {
                 layer.ack_configure(serial);
-                match state.renderer.as_mut() {
-                    Ok(renderer) if width != state.logical_width => {
-                        state.logical_width = width;
-                        renderer.rescale(state.scale120 as i32, state.logical_width as i32);
-                        state.dirty = true;
-                    },
-                    Err(font) => {
-                        let mut renderer = Renderer::new(font.to_owned());
-                        state.logical_width = width;
-                        renderer.rescale(state.scale120 as i32, state.logical_width as i32);
-                        state.dirty = true;
-                        state.renderer = Ok(renderer);
-                    },
-                    _ => {}
-                }
-            }
+                state.logical_width = width;
+                let renderer = state.renderer.get_or_insert_with(|| Renderer::new(state.font.take().unwrap()));
+                renderer.rescale(state.scale120 as i32, state.logical_width as i32);
+                state.dirty = true;
+            },
             zwlr_layer_surface_v1::Event::Closed => state.exit = true,
             _ => {}
         }
@@ -276,7 +266,7 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event && scale != 0 && scale != state.scale120 {
             state.scale120 = scale;
-            if let Ok(renderer) = state.renderer.as_mut() {
+            if let Some(renderer) = state.renderer.as_mut() {
                 renderer.rescale(scale as i32, state.logical_width as i32);
             }
             state.dirty = true;
@@ -346,7 +336,8 @@ fn main() -> anyhow::Result<()> {
             battery: Battery::None,
             time,
         },
-        renderer: Err(font),
+        renderer: None,
+        font: Some(font),
         compositor: None,
         layer_shell: None,
         fractional: None,
