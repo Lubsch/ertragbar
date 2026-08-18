@@ -94,18 +94,6 @@ impl UeventSocket {
     /// Drain all pending messages without parsing them. Returns true if at
     /// least one arrived, i.e. something changed and state should be re-read.
     pub fn drain(&self) -> bool {
-        drain_socket(self.0.as_fd())
+        crate::socket::drain(self.0.as_fd())
     }
-}
-
-/// Read and discard everything queued on a nonblocking socket.
-pub(crate) fn drain_socket(fd: std::os::fd::BorrowedFd<'_>) -> bool {
-    let mut buf = [0u8; 4096];
-    let mut got = false;
-    while let Ok((n, _)) = net::recv(fd, &mut buf, net::RecvFlags::DONTWAIT) {
-        if n > 0 {
-            got = true;
-        }
-    }
-    got
 }

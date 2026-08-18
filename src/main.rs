@@ -2,7 +2,7 @@ use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
 use nanoserde::DeJson;
-use rustix::mm;
+use rustix::{event, mm};
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
@@ -33,6 +33,7 @@ mod battery;
 mod time;
 mod render;
 mod gamma;
+mod socket;
 
 #[derive(Debug)]
 struct Bar {
@@ -40,13 +41,6 @@ struct Bar {
     network: Network,
     battery: Battery,
     time: Time
-}
-
-fn main() -> anyhow::Result<()> {
-    let font = std::fs::read("/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf")?;
-    let font = fontdue::Font::from_bytes(font.as_slice(), fontdue::FontSettings::default())
-        .map_err(|e| anyhow::anyhow!("font parse: {e}"))?;
-    run(font)
 }
 
 // --------------------------------------------------------------- shm buffers
@@ -342,8 +336,6 @@ ignore!(
     ZwlrLayerShellV1, WpFractionalScaleManagerV1, WpViewporter, WpViewport,
 );
 
-// ----------------------------------------------------------------------- run
-
 /// Read the expiration count to clear readability. ECANCELED means the clock was
 /// stepped (TFD_TIMER_CANCEL_ON_SET); we re-arm and repaint either way.
 fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
@@ -355,7 +347,11 @@ fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let font = std::fs::read("/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf")?;
+    let font = fontdue::Font::from_bytes(font.as_slice(), fontdue::FontSettings::default())
+        .map_err(|e| anyhow::anyhow!("font parse: {e}"))?;
+
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -458,23 +454,23 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
         };
 
         let mut fds = [
-            rustix::event::PollFd::new(&conn, rustix::event::PollFlags::IN),
-            rustix::event::PollFd::new(&timer, rustix::event::PollFlags::IN),
-            rustix::event::PollFd::new(&tags_rd_fd, rustix::event::PollFlags::IN),
-            rustix::event::PollFd::new(&uevent_fd, rustix::event::PollFlags::IN),
-            rustix::event::PollFd::new(&netlink_fd, rustix::event::PollFlags::IN),
+            event::PollFd::new(&conn, event::PollFlags::IN),
+            event::PollFd::new(&timer, event::PollFlags::IN),
+            event::PollFd::new(&tags_rd_fd, event::PollFlags::IN),
+            event::PollFd::new(&uevent_fd, event::PollFlags::IN),
+            event::PollFd::new(&netlink_fd, event::PollFlags::IN),
         ];
 
-        rustix::event::poll(&mut fds, None)?;
+        event::poll(&mut fds, None)?;
 
-        if fds[0].revents().contains(rustix::event::PollFlags::IN) {
+        if fds[0].revents().contains(event::PollFlags::IN) {
             guard.read()?;
         } else {
             drop(guard);
         }
         queue.dispatch_pending(&mut app)?;
 
-        if fds[1].revents().contains(rustix::event::PollFlags::IN) {
+        if fds[1].revents().contains(event::PollFlags::IN) {
             drain_timer(timer.as_fd())?;
             while let Err(e) = crate::time::arm_next_minute(&timer) {
                 eprintln!("Error setting timer: {e}");
@@ -495,7 +491,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[2].revents().contains(rustix::event::PollFlags::IN) {
+        if fds[2].revents().contains(event::PollFlags::IN) {
             // A tag switch can emit several lines at once. Drain everything
             // buffered and keep only the last, so a burst costs one paint.
             let mut latest: Option<[TagState; 9]> = None;
@@ -522,7 +518,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[3].revents().contains(rustix::event::PollFlags::IN) {
+        if fds[3].revents().contains(event::PollFlags::IN) {
             uevent.drain();
             let b = battery::read(&battery_path);
             if b != app.bar.battery {
@@ -531,7 +527,7 @@ pub fn run(font: fontdue::Font) -> anyhow::Result<()> {
             }
         }
 
-        if fds[4].revents().contains(rustix::event::PollFlags::IN) {
+        if fds[4].revents().contains(event::PollFlags::IN) {
             netlink.drain();
             let n = crate::network::read();
             if n != app.bar.network {

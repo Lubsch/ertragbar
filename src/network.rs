@@ -78,7 +78,7 @@ fn has_routable_addr(iface: &str) -> bool {
             if f.len() < 6 || f[5] != iface {
                 continue;
             }
-            if f[3].eq_ignore_ascii_case("00") {
+            if f[3] == "00" {
                 return true; // global scope
             }
         }
@@ -128,13 +128,11 @@ pub fn read() -> Network {
     }
 }
 
-// --------------------------------------------------------- rtnetlink socket
-
 /// Netlink socket subscribed to link and address changes. Used as a wakeup
 /// only; payloads are drained and discarded.
 pub struct NetlinkSocket(OwnedFd);
 
-// Multicast group bits (RTMGRP_*), which libc doesn't always expose.
+// Multicast group bits (RTMGRP_*)
 const RTMGRP_LINK: u32 = 1;
 const RTMGRP_IPV4_IFADDR: u32 = 0x10;
 const RTMGRP_IPV6_IFADDR: u32 = 0x100;
@@ -157,6 +155,6 @@ impl NetlinkSocket {
 
     /// Drain queued messages without parsing. True if anything arrived.
     pub fn drain(&self) -> bool {
-        crate::battery::drain_socket(self.0.as_fd())
+        crate::socket::drain(self.0.as_fd())
     }
 }

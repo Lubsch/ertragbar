@@ -23,11 +23,11 @@ pub fn poll_time() -> anyhow::Result<Time> {
     unsafe { libc::localtime_r(&secs, &mut tm) };
 
     Ok(Time {
-        year: (1900 + tm.tm_year).try_into()?,
-        month: (1 + tm.tm_mon).try_into()?,
-        day: tm.tm_mday.try_into()?,
-        hour: tm.tm_hour.try_into()?,
-        minute: tm.tm_min.try_into()?,
+        year: (1900 + tm.tm_year),
+        month: (1 + tm.tm_mon),
+        day: tm.tm_mday,
+        hour: tm.tm_hour,
+        minute: tm.tm_min,
     })
 }
 
