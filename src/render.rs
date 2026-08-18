@@ -16,6 +16,7 @@ const FG: u32 = 0xffebdbb2;
 const FG_DIM: u32 = 0xff101010; // empty tags
 
 /// A rasterized glyph: coverage bitmap + placement metrics, all in physical px.
+#[derive(Debug)]
 struct Glyph {
     bitmap: Vec<u8>, // coverage, width*height bytes
     width: usize,
@@ -25,7 +26,7 @@ struct Glyph {
     advance: f32,  // pen advance in physical px
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Layout {
     pub phys_width: i32,
     pub phys_height: i32,
@@ -34,6 +35,7 @@ pub struct Layout {
     pub baseline: i32
 }
 
+#[derive(Debug)]
 pub struct Renderer {
     font: Font,
     font_px: f32,
@@ -44,9 +46,7 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(font: Font) -> Self {
-        let mut r = Renderer { font, cache: HashMap::new(), font_px: LOGICAL_FONT_PX as f32, layout: Layout::default() };
-        r.rescale(120, 1920);
-        r
+        Renderer { font, cache: HashMap::new(), font_px: LOGICAL_FONT_PX as f32, layout: Layout::default() }
     }
 
     pub fn layout(&self) -> &Layout {

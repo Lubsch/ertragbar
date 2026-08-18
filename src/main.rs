@@ -47,7 +47,7 @@ struct Bar {
 /// A memfd-backed pool holding exactly two buffers we alternate between.
 /// `busy` marks one the compositor still holds.
 struct Buffers {
-    _file: OwnedFd,
+    file: OwnedFd,
     pool: WlShmPool,
     /// mmap covering both buffers; valid for the life of this struct.
     map: *mut u8,
@@ -81,8 +81,8 @@ impl Buffers {
         let mk = |idx: usize, offset: usize| Slot {
             buffer: pool.create_buffer(
                 offset as i32,
-                width as i32,
-                height as i32,
+                width,
+                height,
                 stride as i32,
                 wl_shm::Format::Argb8888,
                 qh,
@@ -93,7 +93,7 @@ impl Buffers {
         };
         let slots = [mk(0, 0), mk(1, one)];
 
-        Ok(Buffers { _file: file, pool, map: map as *mut u8, map_len, width, height, slots })
+        Ok(Buffers { file, pool, map: map as *mut u8, map_len, width, height, slots })
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -140,21 +140,21 @@ pub struct App {
     scale120: u32,
     /// Logical width from the layer-surface configure.
     logical_width: u32,
-    configured: bool,
     dirty: bool,
 
     buffers: Option<Buffers>,
-    renderer: Renderer,
+    renderer: Result<Renderer, fontdue::Font>,
     bar: Bar,
     exit: bool,
 }
 
 impl App {
     fn paint(&mut self, qh: &QueueHandle<App>) -> anyhow::Result<()> {
-        if !self.configured || self.logical_width == 0 {
-            return Ok(());
-        }
-        let render::Layout { phys_width: pw, phys_height: ph, .. } = *self.renderer.layout();
+        let Ok(renderer) = self.renderer.as_mut() else {
+            return Ok(())
+        };
+
+        let render::Layout { phys_width: pw, phys_height: ph, .. } = *renderer.layout();
 
         // Reallocate only when the physical size actually changed.
         let stale = match &self.buffers {
@@ -174,21 +174,16 @@ impl App {
             return Ok(());
         };
 
-        // Render. Split the field borrows so `renderer` and `buffers` can both be
-        // borrowed mutably at once; the scope ends before we touch `self` again.
-        {
-            let App { buffers, renderer, bar, .. } = self;
-            let bufs = buffers.as_mut().expect("checked above");
-            renderer.draw(bar, bufs.pixels(idx), pw);
-        }
+        let bufs = self.buffers.as_mut().expect("checked above");
+        renderer.draw(&self.bar, bufs.pixels(idx), pw);
 
         let surface = self.surface.as_ref().expect("surface");
         if let Some(vp) = &self.viewport {
-            vp.set_destination(self.renderer.layout().dest_width as i32, LOGICAL_HEIGHT as i32);
+            vp.set_destination(renderer.layout().dest_width, LOGICAL_HEIGHT);
         }
         let bufs = self.buffers.as_ref().expect("checked above");
         surface.attach(Some(&bufs.slots[idx].buffer), 0, 0);
-        surface.damage_buffer(0, 0, pw as i32, ph as i32);
+        surface.damage_buffer(0, 0, pw, ph);
         surface.commit();
 
         // Mark in flight until the compositor sends `release`.
@@ -248,16 +243,21 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for App {
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, width, .. } => {
                 layer.ack_configure(serial);
-                if width > 0 && width != state.logical_width {
-                    state.logical_width = width;
-                    state.renderer.rescale(state.scale120 as i32, state.logical_width as i32);
-                    state.dirty = true;
+                match state.renderer.as_mut() {
+                    Ok(renderer) if width != state.logical_width => {
+                        state.logical_width = width;
+                        renderer.rescale(state.scale120 as i32, state.logical_width as i32);
+                        state.dirty = true;
+                    },
+                    Err(font) => {
+                        let mut renderer = Renderer::new(font.to_owned());
+                        state.logical_width = width;
+                        renderer.rescale(state.scale120 as i32, state.logical_width as i32);
+                        state.dirty = true;
+                        state.renderer = Ok(renderer);
+                    },
+                    _ => {}
                 }
-                if !state.configured {
-                    state.configured = true;
-                    state.dirty = true;
-                }
-                // No paint here; the loop paints once after dispatching.
             }
             zwlr_layer_surface_v1::Event::Closed => state.exit = true,
             _ => {}
@@ -276,7 +276,9 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
     ) {
         if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event && scale != 0 && scale != state.scale120 {
             state.scale120 = scale;
-            state.renderer.rescale(scale as i32, state.logical_width as i32);
+            if let Ok(renderer) = state.renderer.as_mut() {
+                renderer.rescale(scale as i32, state.logical_width as i32);
+            }
             state.dirty = true;
         }
     }
@@ -338,6 +340,13 @@ fn main() -> anyhow::Result<()> {
     let tags = tags::mmsg_to_tags(tags::poll_tags()?)?;
     let time = crate::time::poll_time()?;
     let mut app = App {
+        bar: Bar {
+            tags,
+            network: Network::WifiDisconnected,
+            battery: Battery::None,
+            time,
+        },
+        renderer: Err(font),
         compositor: None,
         layer_shell: None,
         fractional: None,
@@ -347,16 +356,8 @@ fn main() -> anyhow::Result<()> {
         viewport: None,
         scale120: 120,
         logical_width: 0,
-        configured: false,
         dirty: true,
         buffers: None,
-        renderer: Renderer::new(font),
-        bar: Bar {
-            tags,
-            network: Network::WifiDisconnected,
-            battery: Battery::None,
-            time,
-        },
         exit: false,
     };
 
@@ -380,7 +381,7 @@ fn main() -> anyhow::Result<()> {
     );
     layer.set_anchor(Anchor::Top | Anchor::Left | Anchor::Right);
     layer.set_size(0, LOGICAL_HEIGHT as u32); // width 0 => span the anchored edges
-    layer.set_exclusive_zone(LOGICAL_HEIGHT as i32);
+    layer.set_exclusive_zone(LOGICAL_HEIGHT);
 
     if let Some(mgr) = app.fractional.take() {
         mgr.get_fractional_scale(&surface, &qh, ());
@@ -403,7 +404,6 @@ fn main() -> anyhow::Result<()> {
     let stdout = child.stdout.take().unwrap();
     let mut tags_rd = std::io::BufReader::new(stdout);
     let tags_rd_raw = tags_rd.get_ref().as_raw_fd();
-
     let battery_path = battery::battery_path();
     let uevent = battery::UeventSocket::new()?;
     let uevent_fd = uevent.as_fd();
