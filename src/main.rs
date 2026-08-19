@@ -3,6 +3,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 
 use nanoserde::DeJson;
 use rustix::{event, mm};
+use wayland_client::protocol::wl_output::WlOutput;
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
@@ -25,6 +26,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
+use crate::render::Layout;
 use crate::{battery::Battery, network::Network, render::{LOGICAL_HEIGHT, Renderer}, tags::TagState, time::Time};
 
 mod tags;
@@ -36,11 +38,12 @@ mod socket;
 
 #[derive(Debug)]
 struct Bar {
-    tags: [TagState; 9],
+    tags: Vec<(String, [TagState; 9])>, // (monitor_name, tags)
     network: Network,
     battery: Battery,
     time: Time
 }
+
 
 // --------------------------------------------------------------- shm buffers
 
@@ -122,40 +125,32 @@ impl Drop for Buffers {
     }
 }
 
-// ----------------------------------------------------------------- app state
+struct Monitor {
+    dirty: bool,
+    surface: Option<WlSurface>,
+    viewport: Option<WpViewport>,
+    layout: Layout,
+    buffers: Option<Buffers>,
+    bar: Bar,
+}
 
-pub struct App {
-    // Bound globals. The registry handler can't build the surface itself, so
-    // these park here until run() picks them up.
+struct App {
     compositor: Option<WlCompositor>,
+    wl_output: Option<WlOutput>,
     layer_shell: Option<ZwlrLayerShellV1>,
     fractional: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     shm: Option<WlShm>,
 
-    surface: Option<WlSurface>,
-    viewport: Option<WpViewport>,
-
-    /// Fractional scale x120 (120 == 1.0).
-    scale120: u32,
-    /// Logical width from the layer-surface configure.
-    logical_width: u32,
-    dirty: bool,
-
-    buffers: Option<Buffers>,
-    renderer: Option<Renderer>,
-    font: Option<fontdue::Font>,
+    monitors: Vec<Monitor>,
+    font: fontdue::Font,
     bar: Bar,
     exit: bool,
 }
 
-impl App {
-    fn paint(&mut self, qh: &QueueHandle<App>) -> anyhow::Result<()> {
-        let Some(renderer) = self.renderer.as_mut() else {
-            return Ok(())
-        };
-
-        let render::Layout { phys_width: pw, phys_height: ph, .. } = *renderer.layout();
+impl Monitor {
+    fn paint(&mut self, qh: &QueueHandle<App>, app: &App) -> anyhow::Result<()> {
+        let Layout { phys_width: pw, phys_height: ph, .. } = self.layout;
 
         // Reallocate only when the physical size actually changed.
         let stale = match &self.buffers {
@@ -163,7 +158,7 @@ impl App {
             Some(b) => b.width != pw || b.height != ph,
         };
         if stale {
-            let shm = self.shm.as_ref().expect("shm bound");
+            let shm = app.shm.as_ref().expect("shm bound");
             // Drop the old pool before creating the new one.
             self.buffers = None;
             self.buffers = Some(Buffers::new(shm, qh, pw, ph)?);
@@ -176,11 +171,11 @@ impl App {
         };
 
         let bufs = self.buffers.as_mut().expect("checked above");
-        renderer.draw(&self.bar, bufs.pixels(idx), pw);
+        render::draw(&self.bar, bufs.pixels(idx), pw);
 
         let surface = self.surface.as_ref().expect("surface");
         if let Some(vp) = &self.viewport {
-            vp.set_destination(renderer.layout().dest_width, LOGICAL_HEIGHT);
+            vp.set_destination(self.layout.dest_width, LOGICAL_HEIGHT);
         }
         let bufs = self.buffers.as_ref().expect("checked above");
         surface.attach(Some(&bufs.slots[idx].buffer), 0, 0);
@@ -193,8 +188,6 @@ impl App {
         Ok(())
     }
 }
-
-// ------------------------------------------------------------------ dispatch
 
 impl Dispatch<WlRegistry, ()> for App {
     fn event(
@@ -209,6 +202,9 @@ impl Dispatch<WlRegistry, ()> for App {
             return;
         };
         match interface.as_str() {
+            "wl_output" => {
+                state.wl_output = Some(registry.bind::<WlOutput, _, _>(name, version.min(1), qh, ()));
+            }
             "wl_compositor" => {
                 state.compositor =
                     Some(registry.bind::<WlCompositor, _, _>(name, version.min(6), qh, ()));
@@ -228,6 +224,23 @@ impl Dispatch<WlRegistry, ()> for App {
                 state.viewporter = Some(registry.bind::<WpViewporter, _, _>(name, 1, qh, ()));
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<WlOutput, u32> for App {
+    fn event(
+        state: &mut Self,
+        _: &WlOutput,
+        event: <WlOutput as Proxy>::Event,
+        id: &u32,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            wayland_client::protocol::wl_output::Event::Name { name } => todo!(),
+            wayland_client::protocol::wl_output::Event::Done => todo!(),
+            _ => todo!(),
         }
     }
 }
@@ -336,19 +349,12 @@ fn main() -> anyhow::Result<()> {
             battery: Battery::None,
             time,
         },
-        renderer: None,
-        font: Some(font),
+        font,
         compositor: None,
         layer_shell: None,
         fractional: None,
         viewporter: None,
         shm: None,
-        surface: None,
-        viewport: None,
-        scale120: 120,
-        logical_width: 0,
-        dirty: true,
-        buffers: None,
         exit: false,
     };
 

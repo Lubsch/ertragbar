@@ -32,7 +32,10 @@ pub struct Layout {
     pub phys_height: i32,
     pub dest_width: i32,
     pub pad_x: i32,
-    pub baseline: i32
+    pub baseline: i32,
+
+    pub scale120: u32,
+    pub logical_width: u32,
 }
 
 #[derive(Debug)]
