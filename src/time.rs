@@ -11,7 +11,7 @@ pub struct Time {
     pub month: i32,
     pub day: i32,
     pub hour: i32,
-    pub minute: i32
+    pub minute: i32,
 }
 
 /// Current local wall-clock date and time
@@ -39,13 +39,22 @@ pub fn minute_timerfd() -> anyhow::Result<OwnedFd> {
 
 /// Arm (or re-arm) the timerfd to fire at the next whole minute.
 pub fn arm_next_minute(timer: &OwnedFd) -> anyhow::Result<()> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     let next = ((now / 60) + 1) * 60;
     let spec = time::Itimerspec {
-        it_value: time::Timespec { tv_sec: next as i64, tv_nsec: 0 },
-        it_interval: time::Timespec { tv_sec: 0, tv_nsec: 0 },
+        it_value: time::Timespec {
+            tv_sec: next as i64,
+            tv_nsec: 0,
+        },
+        it_interval: time::Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        },
     };
-    let flags = time::TimerfdTimerFlags::ABSTIME |  time::TimerfdTimerFlags::CANCEL_ON_SET;
+    let flags = time::TimerfdTimerFlags::ABSTIME | time::TimerfdTimerFlags::CANCEL_ON_SET;
     time::timerfd_settime(timer, flags, &spec)?;
     Ok(())
 }

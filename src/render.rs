@@ -1,5 +1,6 @@
-use std::collections::HashMap;
 use fontdue::Font;
+use std::collections::HashMap;
+use std::thread::JoinHandle;
 
 use crate::Bar;
 use crate::battery::{Battery, Percentage};
@@ -21,9 +22,9 @@ struct Glyph {
     bitmap: Vec<u8>, // coverage, width*height bytes
     width: usize,
     height: usize,
-    xmin: i32,     // offset from pen x to bitmap left
-    ymin: i32,     // fontdue: offset of bitmap bottom from baseline
-    advance: f32,  // pen advance in physical px
+    xmin: i32,    // offset from pen x to bitmap left
+    ymin: i32,    // fontdue: offset of bitmap bottom from baseline
+    advance: f32, // pen advance in physical px
 }
 
 #[derive(Default, Debug)]
@@ -35,124 +36,95 @@ pub struct Layout {
     pub baseline: i32,
 
     pub scale120: u32,
+    pub font_px: f32,
     pub logical_width: u32,
 }
 
-#[derive(Debug)]
-pub struct Renderer {
-    font: Font,
-    font_px: f32,
-    /// Glyph cache keyed by (char, font_px bits)
-    cache: HashMap<char, Glyph>,
-    layout: Layout
+/// Paint `bar` into `buf` (len must be width*height, ARGB8888 physical px).
+pub fn draw(
+    buf: &mut [u32],
+    bar: &Bar,
+    tags: &[TagState; 9],
+    layout: &Layout,
+    gc: &mut GlyphCache,
+) {
+    let width = layout.phys_width as usize;
+    let height = layout.phys_height as usize;
+    assert_eq!(buf.len(), width * height, "buffer size mismatch");
+
+    // Background fill.
+    buf.fill(BG);
+
+    // Left side: tags as full-height squares, first one flush to the left edge.
+    let side = height as i32;
+    let mut pen: f32 = 0.0; // flush left, no pad
+
+    for (i, tag) in tags.iter().enumerate() {
+        let label = format!("{}", i + 1);
+        let (square, text) = match tag {
+            TagState::Empty => (BG, FG_DIM),
+            TagState::Occupied => (BG, FG),
+            TagState::Selected => (FG, BG),
+        };
+
+        let x0 = pen.round() as i32;
+        fill_rect(buf, (width, height), (x0, 0), (side, side), square);
+
+        // Center the digit inside the square.
+        let tw = gc.measure(&label, layout);
+        let tx = pen + (side as f32 - tw) * 0.5;
+        gc.draw_text(&label, tx, text, buf, width, height, layout);
+
+        pen += side as f32; // squares touch; add a gap here if you want spacing
+    }
+
+    // Right side: assemble the status string, right-align it.
+    let right = right_text(bar);
+    let text_w = gc.measure(&right, layout);
+    let start_x = (width as f32) - layout.pad_x as f32 - text_w;
+    gc.draw_text(&right, start_x, FG, buf, width, height, layout);
 }
 
-impl Renderer {
-    pub fn new(font: Font) -> Self {
-        Renderer { font, cache: HashMap::new(), font_px: LOGICAL_FONT_PX as f32, layout: Layout::default() }
-    }
+pub struct GlyphCache {
+    font_thread: Option<JoinHandle<Font>>,
+    font: Option<Font>,
+    cache: HashMap<(char, u32), Glyph>,
+}
 
-    pub fn layout(&self) -> &Layout {
-        &self.layout
-    }
-
-    pub fn rescale(&mut self, scale120: i32, logical_width: i32) {
-        let phys_height = (LOGICAL_HEIGHT * scale120 + 60) / 120;
-        let phys_width  = (logical_width  * scale120 + 60) / 120;
-
-        self.font_px = LOGICAL_FONT_PX as f32 * phys_height as f32 / LOGICAL_HEIGHT as f32;
-
-        let lm = self.font.horizontal_line_metrics(self.font_px).unwrap();
-        let baseline = ((phys_height as f32 - (lm.ascent - lm.descent)) * 0.5 + lm.ascent).round() as i32;
-
-        self.cache.clear();
-
-        self.layout = Layout {
-            phys_height,
-            phys_width,
-            dest_width: (phys_width * LOGICAL_HEIGHT + phys_height / 2) / phys_height,
-            pad_x: (LOGICAL_PAD_X * phys_height + LOGICAL_HEIGHT / 2) / LOGICAL_HEIGHT,
-            baseline
-        };
-    }
-
-    fn glyph(&mut self, ch: char) -> &Glyph {
-        self.cache.entry(ch).or_insert_with(|| {
-            let (m, bitmap) = self.font.rasterize(ch, self.font_px);
-            Glyph {
-                bitmap,
-                width: m.width,
-                height: m.height,
-                xmin: m.xmin,
-                ymin: m.ymin,
-                advance: m.advance_width,
-            }
-        })
+impl GlyphCache {
+    pub fn new(font_thread: JoinHandle<Font>) -> Self {
+        GlyphCache {
+            font_thread: Some(font_thread),
+            font: None,
+            cache: HashMap::new(),
+        }
     }
 
     /// Measure the advance width of a string in physical px (for right-aligning).
-    fn measure(&mut self, s: &str) -> f32 {
-        s.chars().map(|c| self.glyph(c).advance).sum()
+    fn measure(&mut self, s: &str, layout: &Layout) -> f32 {
+        s.chars().map(|c| self.glyph(c, layout).advance).sum()
     }
 
-    /// Paint `bar` into `buf` (len must be width*height, ARGB8888 physical px).
-    pub fn draw(&mut self, bar: &Bar, buf: &mut [u32], width: i32) {
-        let width = width as usize;
-        let height = self.layout.phys_height as usize;
-        assert_eq!(buf.len(), width * height, "buffer size mismatch");
-
-        // Background fill.
-        for px in buf.iter_mut() {
-            *px = BG;
+    fn glyph(&mut self, ch: char, layout: &Layout) -> &Glyph {
+        if let Some(font_thread) = self.font_thread.take() {
+            self.font = Some(font_thread.join().unwrap());
         }
-        // Left side: tags as full-height squares, first one flush to the left edge.
-        let side = self.layout.phys_height;   // square = bar height, exactly
-        let mut pen: f32 = 0.0;       // flush left, no pad
-
-        for (i, tag) in bar.tags.iter().enumerate() {
-            let label = format!("{}", i + 1);
-            let (square, text) = match tag {
-                TagState::Empty    => (BG, FG_DIM),
-                TagState::Occupied => (BG, FG),
-                TagState::Selected => (FG, BG),
-            };
-
-            let x0 = pen.round() as i32;
-            fill_rect(buf, (width, height), (x0, 0), (side, side), square);
-
-            // Center the digit inside the square.
-            let tw = self.measure(&label);
-            let tx = pen + (side as f32 - tw) * 0.5;
-            self.draw_text(&label, tx, text, buf, width, height);
-
-            pen += side as f32;   // squares touch; add a gap here if you want spacing
-        }
-
-        // Right side: assemble the status string, right-align it.
-        let right = self.right_text(bar);
-        let text_w = self.measure(&right);
-        let start_x = (width as f32) - self.layout.pad_x as f32 - text_w;
-        self.draw_text(&right, start_x, FG, buf, width, height);
+        self.cache
+            .entry((ch, layout.font_px as u32 * 120))
+            .or_insert_with(|| {
+                let (m, bitmap) = self.font.as_ref().unwrap().rasterize(ch, layout.font_px);
+                Glyph {
+                    bitmap,
+                    width: m.width,
+                    height: m.height,
+                    xmin: m.xmin,
+                    ymin: m.ymin,
+                    advance: m.advance_width,
+                }
+            })
     }
 
-    fn right_text(&self, bar: &Bar) -> String {
-        let net = match bar.network {
-            Network::WifiConnected => "Wifi",    // nf-fa-wifi
-            Network::WifiDisconnected => "No Wifi :(", // nf-md-wifi_off
-            Network::Ethernet => "Ethernet",         // nf-md-ethernet
-        };
-        let bat = match bar.battery {
-            Battery::None => String::new(),
-            Battery::Charging(Percentage(p)) => format!("{p}% ▲   "),
-            Battery::Discharging(Percentage(p)) => format!("{p}% ▼   "),
-            Battery::Unknown(Percentage(p)) => format!("{p}% —   ")
-        };
-        let crate::time::Time { year, month, day, hour, minute } = bar.time;
-        format!("{net}   {bat}{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
-    }
-
-    /// Draw a run of text starting at pen x = `x`, baseline from `m`. Returns the
-    /// pen x after the run.
+    /// Returns the pen x after the run.
     fn draw_text(
         &mut self,
         s: &str,
@@ -161,13 +133,14 @@ impl Renderer {
         buf: &mut [u32],
         width: usize,
         height: usize,
+        layout: &Layout,
     ) -> f32 {
         let mut pen = x;
-        let baseline = self.layout.baseline;
+        let baseline = layout.baseline;
         for ch in s.chars() {
             // Copy the glyph out of the cache to avoid borrowing self across the
             // blit loop.
-            let g = self.glyph(ch);
+            let g = self.glyph(ch, layout);
             let (gw, gh, gxmin, gymin) = (g.width, g.height, g.xmin, g.ymin);
             let advance = g.advance;
             let bitmap = &g.bitmap;
@@ -212,6 +185,51 @@ impl Renderer {
         pen
     }
 }
+
+fn right_text(bar: &Bar) -> String {
+    let net = match bar.network {
+        Network::WifiConnected => "Wifi",          // nf-fa-wifi
+        Network::WifiDisconnected => "No Wifi :(", // nf-md-wifi_off
+        Network::Ethernet => "Ethernet",           // nf-md-ethernet
+    };
+    let bat = match bar.battery {
+        Battery::None => String::new(),
+        Battery::Charging(Percentage(p)) => format!("{p}% ▲   "),
+        Battery::Discharging(Percentage(p)) => format!("{p}% ▼   "),
+        Battery::Unknown(Percentage(p)) => format!("{p}% —   "),
+    };
+    let crate::time::Time {
+        year,
+        month,
+        day,
+        hour,
+        minute,
+    } = bar.time;
+    format!("{net}   {bat}{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+// /// Draw a run of text starting at pen x = `x`, baseline from `m`.
+// impl Renderer {
+//     pub fn rescale(&mut self, scale120: i32, logical_width: i32) {
+//         let phys_height = (LOGICAL_HEIGHT * scale120 + 60) / 120;
+//         let phys_width  = (logical_width  * scale120 + 60) / 120;
+//
+//
+//         let lm = self.font.horizontal_line_metrics(self.font_px).unwrap();
+//         let baseline = ((phys_height as f32 - (lm.ascent - lm.descent)) * 0.5 + lm.ascent).round() as i32;
+//
+//         self.cache.clear();
+//
+//         self.layout = Layout {
+//             phys_height,
+//             phys_width,
+//             dest_width: (phys_width * LOGICAL_HEIGHT + phys_height / 2) / phys_height,
+//             pad_x: (LOGICAL_PAD_X * phys_height + LOGICAL_HEIGHT / 2) / LOGICAL_HEIGHT,
+//             baseline
+//         };
+//     }
+//
+// }
 
 fn fill_rect(
     buf: &mut [u32],

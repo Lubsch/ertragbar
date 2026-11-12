@@ -1,5 +1,6 @@
 use std::io::BufRead;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::thread::JoinHandle;
 
 use nanoserde::DeJson;
 use rustix::{event, mm};
@@ -26,26 +27,49 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
-use crate::render::Layout;
-use crate::{battery::Battery, network::Network, render::{LOGICAL_HEIGHT, Renderer}, tags::TagState, time::Time};
+use crate::render::{GlyphCache, Layout};
+use crate::{
+    battery::Battery, network::Network, render::LOGICAL_HEIGHT, tags::TagState, time::Time,
+};
 
-mod tags;
-mod network;
 mod battery;
-mod time;
+mod network;
 mod render;
 mod socket;
+mod tags;
+mod time;
 
 #[derive(Debug)]
 struct Bar {
-    tags: Vec<(String, [TagState; 9])>, // (monitor_name, tags)
     network: Network,
     battery: Battery,
-    time: Time
+    time: Time,
 }
 
+struct Monitor {
+    name: String,
+    dirty: bool,
+    tags: [TagState; 9],
+    wl_output: WlOutput,
+    surface: Option<WlSurface>,
+    viewport: Option<WpViewport>,
+    layout: Layout,
+}
 
-// --------------------------------------------------------------- shm buffers
+struct App {
+    compositor: Option<WlCompositor>,
+    layer_shell: Option<ZwlrLayerShellV1>,
+    fractional: Option<WpFractionalScaleManagerV1>,
+    viewporter: Option<WpViewporter>,
+    shm: Option<WlShm>,
+    buffers: Option<Buffers>,
+
+    monitors: Vec<Monitor>,
+    glyph_cache: GlyphCache,
+    bar: Bar,
+    dirty: bool,
+    should_exit: bool,
+}
 
 /// A memfd-backed pool holding exactly two buffers we alternate between.
 /// `busy` marks one the compositor still holds.
@@ -77,7 +101,14 @@ impl Buffers {
 
         // SAFETY: file is a fresh memfd of exactly map_len bytes.
         let map = unsafe {
-            mm::mmap(std::ptr::null_mut(), map_len, mm::ProtFlags::READ | mm::ProtFlags::WRITE, mm::MapFlags::SHARED, &file, 0)?
+            mm::mmap(
+                std::ptr::null_mut(),
+                map_len,
+                mm::ProtFlags::READ | mm::ProtFlags::WRITE,
+                mm::MapFlags::SHARED,
+                &file,
+                0,
+            )?
         };
 
         let pool = shm.create_pool(file.as_fd(), map_len as i32, qh, ());
@@ -96,7 +127,15 @@ impl Buffers {
         };
         let slots = [mk(0, 0), mk(1, one)];
 
-        Ok(Buffers { _file: file, pool, map: map as *mut u8, map_len, width, height, slots })
+        Ok(Buffers {
+            _file: file,
+            pool,
+            map: map as *mut u8,
+            map_len,
+            width,
+            height,
+            slots,
+        })
     }
 
     fn free_slot(&self) -> Option<usize> {
@@ -125,32 +164,13 @@ impl Drop for Buffers {
     }
 }
 
-struct Monitor {
-    dirty: bool,
-    surface: Option<WlSurface>,
-    viewport: Option<WpViewport>,
-    layout: Layout,
-    buffers: Option<Buffers>,
-    bar: Bar,
-}
-
-struct App {
-    compositor: Option<WlCompositor>,
-    wl_output: Option<WlOutput>,
-    layer_shell: Option<ZwlrLayerShellV1>,
-    fractional: Option<WpFractionalScaleManagerV1>,
-    viewporter: Option<WpViewporter>,
-    shm: Option<WlShm>,
-
-    monitors: Vec<Monitor>,
-    font: fontdue::Font,
-    bar: Bar,
-    exit: bool,
-}
-
 impl Monitor {
     fn paint(&mut self, qh: &QueueHandle<App>, app: &App) -> anyhow::Result<()> {
-        let Layout { phys_width: pw, phys_height: ph, .. } = self.layout;
+        let Layout {
+            phys_width: pw,
+            phys_height: ph,
+            ..
+        } = self.layout;
 
         // Reallocate only when the physical size actually changed.
         let stale = match &self.buffers {
@@ -170,8 +190,15 @@ impl Monitor {
             return Ok(());
         };
 
-        let bufs = self.buffers.as_mut().expect("checked above");
-        render::draw(&self.bar, bufs.pixels(idx), pw);
+        let bufs = self.buffers.as_mut().unwrap();
+
+        render::draw(
+            bufs.pixels(idx),
+            &app.bar,
+            &self.tags,
+            &self.layout,
+            &mut app.glyph_cache,
+        );
 
         let surface = self.surface.as_ref().expect("surface");
         if let Some(vp) = &self.viewport {
@@ -198,12 +225,28 @@ impl Dispatch<WlRegistry, ()> for App {
         _: &Connection,
         qh: &QueueHandle<Self>,
     ) {
-        let wl_registry::Event::Global { name, interface, version } = event else {
+        let wl_registry::Event::Global {
+            name,
+            interface,
+            version,
+        } = event
+        else {
             return;
         };
         match interface.as_str() {
             "wl_output" => {
-                state.wl_output = Some(registry.bind::<WlOutput, _, _>(name, version.min(1), qh, ()));
+                dbg!(&name);
+                let monitor = Monitor {
+                    name: String::new(), // TODO improve
+                    dirty: true,
+                    tags: [TagState::Empty; 9],
+                    wl_output: registry.bind::<WlOutput, _, _>(name, version.min(1), qh, ()),
+                    surface: None,
+                    viewport: None,
+                    layout: Layout::default(),
+                    buffers: None,
+                };
+                state.monitors.push(monitor);
             }
             "wl_compositor" => {
                 state.compositor =
@@ -213,6 +256,7 @@ impl Dispatch<WlRegistry, ()> for App {
                 state.shm = Some(registry.bind::<WlShm, _, _>(name, 1, qh, ()));
             }
             "zwlr_layer_shell_v1" => {
+                dbg!(&name);
                 state.layer_shell =
                     Some(registry.bind::<ZwlrLayerShellV1, _, _>(name, version.min(5), qh, ()));
             }
@@ -228,18 +272,19 @@ impl Dispatch<WlRegistry, ()> for App {
     }
 }
 
-impl Dispatch<WlOutput, u32> for App {
+impl Dispatch<WlOutput, ()> for App {
     fn event(
         state: &mut Self,
-        _: &WlOutput,
+        proxy: &WlOutput,
         event: <WlOutput as Proxy>::Event,
-        id: &u32,
+        _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let monitor_idx = state.monitors.iter().position(|m| m.wl_output.id() == proxy.id()).unwrap();
         match event {
-            wayland_client::protocol::wl_output::Event::Name { name } => todo!(),
-            wayland_client::protocol::wl_output::Event::Done => todo!(),
+            wayland_client::protocol::wl_output::Event::Name { name } => state.monitors[monitor_idx].name = name,
+            wayland_client::protocol::wl_output::Event::Done => { state.monitors.remove(monitor_idx); },
             _ => todo!(),
         }
     }
@@ -254,15 +299,15 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
+        let monitor: &mut Monitor = todo!();
         match event {
             zwlr_layer_surface_v1::Event::Configure { serial, width, .. } => {
                 layer.ack_configure(serial);
-                state.logical_width = width;
-                let renderer = state.renderer.get_or_insert_with(|| Renderer::new(state.font.take().unwrap()));
-                renderer.rescale(state.scale120 as i32, state.logical_width as i32);
-                state.dirty = true;
-            },
-            zwlr_layer_surface_v1::Event::Closed => state.exit = true,
+                monitor.layout.logical_width = width;
+                monitor.dirty = true;
+                // TODO rescale monitor layout properly
+            }
+            zwlr_layer_surface_v1::Event::Closed => state.should_exit = true,
             _ => {}
         }
     }
@@ -277,12 +322,13 @@ impl Dispatch<WpFractionalScaleV1, ()> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event && scale != 0 && scale != state.scale120 {
-            state.scale120 = scale;
-            if let Some(renderer) = state.renderer.as_mut() {
-                renderer.rescale(scale as i32, state.logical_width as i32);
-            }
-            state.dirty = true;
+        let monitor: &mut Monitor = todo!();
+        if let wp_fractional_scale_v1::Event::PreferredScale { scale } = event
+            && scale != monitor.layout.scale120
+        {
+            monitor.layout.scale120 = scale;
+            // TODO rescale monitor layout properly
+            monitor.dirty = true;
         }
     }
 }
@@ -298,10 +344,15 @@ impl Dispatch<WlBuffer, usize> for App {
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let wl_buffer::Event::Release = event
-            && let Some(b) = state.buffers.as_mut()
-            && let Some(s) = b.slots.get_mut(*idx) {
-                s.busy = false;
+        match event {
+            wl_buffer::Event::Release => {
+                if let Some(b) = state.buffers.as_mut()
+                    && let Some(s) = b.slots.get_mut(*idx)
+                {
+                    s.busy = false;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -315,8 +366,14 @@ macro_rules! ignore {
     )*};
 }
 ignore!(
-    WlCompositor, WlShm, WlShmPool, WlSurface,
-    ZwlrLayerShellV1, WpFractionalScaleManagerV1, WpViewporter, WpViewport,
+    WlCompositor,
+    WlShm,
+    WlShmPool,
+    WlSurface,
+    ZwlrLayerShellV1,
+    WpFractionalScaleManagerV1,
+    WpViewporter,
+    WpViewport,
 );
 
 /// Read the expiration count to clear readability. ECANCELED means the clock was
@@ -330,39 +387,23 @@ fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> anyhow::Result<()> {
-    let font = std::fs::read("/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf")?;
-    let font = fontdue::Font::from_bytes(font.as_slice(), fontdue::FontSettings::default())
-        .map_err(|e| anyhow::anyhow!("font parse: {e}"))?;
+fn load_font() -> fontdue::Font {
+    // TODO Load font some proper way
+    let font_file = std::fs::read(
+        "/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
+    ).unwrap();
+    fontdue::Font::from_bytes(font_file.as_slice(), fontdue::FontSettings::default()).unwrap()
+}
 
-    let conn = Connection::connect_to_env()?;
-    let mut queue = conn.new_event_queue();
-    let qh = queue.handle();
-    conn.display().get_registry(&qh, ());
-
-    let tags = tags::mmsg_to_tags(tags::poll_tags()?)?;
-    let time = crate::time::poll_time()?;
-    let mut app = App {
-        bar: Bar {
-            tags,
-            network: Network::WifiDisconnected,
-            battery: Battery::None,
-            time,
-        },
-        font,
-        compositor: None,
-        layer_shell: None,
-        fractional: None,
-        viewporter: None,
-        shm: None,
-        exit: false,
-    };
-
-    queue.roundtrip(&mut app)?; // bind globals
-
-    let compositor = app.compositor.take().ok_or_else(|| anyhow::anyhow!("no wl_compositor"))?;
-    let layer_shell =
-        app.layer_shell.take().ok_or_else(|| anyhow::anyhow!("no zwlr_layer_shell_v1"))?;
+fn initialize_monitor(monitor: &mut Monitor, app: &mut App, qh: &QueueHandle<App>) -> anyhow::Result<()> {
+    let compositor = app
+        .compositor
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no wl_compositor"))?;
+    let layer_shell = app
+        .layer_shell
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("no zwlr_layer_shell_v1"))?;
     if app.shm.is_none() {
         anyhow::bail!("no wl_shm");
     }
@@ -384,13 +425,47 @@ fn main() -> anyhow::Result<()> {
         mgr.get_fractional_scale(&surface, &qh, ());
     }
     if let Some(vp) = app.viewporter.take() {
-        app.viewport = Some(vp.get_viewport(&surface, &qh, ()));
+        monitor.viewport = Some(vp.get_viewport(&surface, &qh, ()));
     }
     surface.commit(); // provoke the first configure
-    app.surface = Some(surface);
+    monitor.surface = Some(surface);
 
-    queue.roundtrip(&mut app)?; // configure + scale
-    app.paint(&qh)?;
+    Ok(())
+}
+
+fn main() -> anyhow::Result<()> {
+    let font_thread: JoinHandle<fontdue::Font> = std::thread::spawn(load_font);
+
+    let conn = Connection::connect_to_env()?;
+    let mut queue = conn.new_event_queue();
+    let qh = queue.handle();
+    conn.display().get_registry(&qh, ());
+
+    let tags = tags::mmsg_to_tags(tags::poll_tags()?);
+    let time = crate::time::poll_time()?;
+    let mut app = App {
+        monitors: vec![],
+        bar: Bar {
+            network: Network::WifiDisconnected,
+            battery: Battery::None,
+            time,
+        },
+        glyph_cache: GlyphCache::new(font_thread),
+        compositor: None,
+        layer_shell: None,
+        fractional: None,
+        viewporter: None,
+        shm: None,
+        dirty: true,
+        should_exit: false,
+    };
+
+    queue.roundtrip(&mut app)?; // bind globals
+
+    // queue.roundtrip(&mut app)?; // configure + scale
+    // for monitor in app.monitors {
+    //     monitor.paint(&qh, &mut app)?;
+    // }
 
     // External event sources.
     let timer = crate::time::minute_timerfd()?;
@@ -415,7 +490,7 @@ fn main() -> anyhow::Result<()> {
     // Reused so the hot path doesn't allocate a String per line.
     let mut line = String::new();
 
-    while !app.exit {
+    while !app.should_exit {
         queue.flush()?;
 
         // None means events are already queued: dispatch them instead of sleeping.
@@ -430,7 +505,10 @@ fn main() -> anyhow::Result<()> {
         let mut fds = [
             event::PollFd::new(&conn, event::PollFlags::IN),
             event::PollFd::new(&timer, event::PollFlags::IN),
-            event::PollFd::from_borrowed_fd(unsafe { BorrowedFd::borrow_raw(tags_rd_raw) }, event::PollFlags::IN),
+            event::PollFd::from_borrowed_fd(
+                unsafe { BorrowedFd::borrow_raw(tags_rd_raw) },
+                event::PollFlags::IN,
+            ),
             event::PollFd::new(&uevent_fd, event::PollFlags::IN),
             event::PollFd::new(&netlink_fd, event::PollFlags::IN),
         ];
@@ -448,10 +526,9 @@ fn main() -> anyhow::Result<()> {
             drain_timer(timer.as_fd())?;
             while let Err(e) = crate::time::arm_next_minute(&timer) {
                 eprintln!("Error setting timer: {e}");
-            };
+            }
             let t = crate::time::poll_time()?;
-            if t != (app.bar.time)
-            {
+            if t != (app.bar.time) {
                 app.bar.time = t;
                 app.dirty = true;
             }
@@ -468,16 +545,15 @@ fn main() -> anyhow::Result<()> {
         if fds[2].revents().contains(event::PollFlags::IN) {
             // A tag switch can emit several lines at once. Drain everything
             // buffered and keep only the last, so a burst costs one paint.
-            let mut latest: Option<[TagState; 9]> = None;
+            let mut latest: Option<Vec<(String, [TagState; 9])>> = None;
             loop {
                 line.clear();
                 match tags_rd.read_line(&mut line) {
                     Ok(0) => anyhow::bail!("mmsg watch exited"),
                     Ok(_) => {
-                        if let Ok(o) = tags::MmsgOutput::deserialize_json(&line)
-                            && let Ok(t) = tags::mmsg_to_tags(o) {
-                                latest = Some(t);
-                            }
+                        if let Ok(o) = tags::MmsgOutput::deserialize_json(&line) {
+                            let latest = Some(tags::mmsg_to_tags(o));
+                        }
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -486,9 +562,15 @@ fn main() -> anyhow::Result<()> {
                     break;
                 }
             }
-            if let Some(tags) = latest && tags != app.bar.tags {
-                app.bar.tags = tags;
-                app.dirty = true;
+
+            if let Some(tags) = latest {
+                for (monitor_name, tags) in tags {
+                    let monitor = app.monitors.iter_mut().find(|m| m.name == monitor_name).unwrap();
+                    if tags != monitor.tags {
+                        monitor.tags = tags;
+                        monitor.dirty = true;
+                    }
+                }
             }
         }
 
@@ -503,16 +585,20 @@ fn main() -> anyhow::Result<()> {
 
         if fds[4].revents().contains(event::PollFlags::IN) {
             netlink.drain();
-            let n = crate::network::read();
+            let n = network::read();
             if n != app.bar.network {
                 app.bar.network = n;
                 app.dirty = true;
             }
         }
 
-        if app.dirty {
-            app.paint(&qh)?;
+        for monitor in &mut app.monitors {
+            if app.dirty || monitor.dirty {
+                monitor.paint(&qh, &app)?;
+                monitor.dirty = false;
+            }
         }
+        app.dirty = false;
     }
 
     let _ = child.kill();

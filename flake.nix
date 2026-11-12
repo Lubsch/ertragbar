@@ -11,6 +11,7 @@
           default = pkgs.mkShell {
             packages = with pkgs; [
               cargo
+              rustfmt
               rustc
               clippy
               cargo-show-asm

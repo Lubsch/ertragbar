@@ -139,11 +139,19 @@ const RTMGRP_IPV6_IFADDR: u32 = 0x100;
 
 impl NetlinkSocket {
     pub fn new() -> anyhow::Result<Self> {
-        let fd = net::socket_with(net::AddressFamily::NETLINK, net::SocketType::RAW, net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK, None)?;
+        let fd = net::socket_with(
+            net::AddressFamily::NETLINK,
+            net::SocketType::RAW,
+            net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK,
+            None,
+        )?;
 
         // Link up/down, and v4/v6 address add/remove -- everything that can
         // change what `read()` would return.
-        let addr = net::netlink::SocketAddrNetlink::new(0, RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR);
+        let addr = net::netlink::SocketAddrNetlink::new(
+            0,
+            RTMGRP_LINK | RTMGRP_IPV4_IFADDR | RTMGRP_IPV6_IFADDR,
+        );
         net::bind(&fd, &addr)?;
 
         Ok(NetlinkSocket(fd))

@@ -1,6 +1,6 @@
 use nanoserde::DeJson;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum TagState {
     Empty,
     Occupied,
@@ -9,26 +9,25 @@ pub enum TagState {
 
 #[derive(Debug, DeJson)]
 pub struct MmsgOutput {
-    all_tags: Vec<MonitorTags>
+    all_tags: Vec<MonitorTags>,
 }
 
 #[derive(Debug, DeJson)]
 struct MonitorTags {
     monitor: String,
-    tags: [Tag; 9]
+    tags: [Tag; 9],
 }
 
 #[derive(Debug, DeJson)]
 struct Tag {
     is_active: bool,
     is_urgent: bool,
-    client_count: u32
+    client_count: u32,
 }
 
-pub fn mmsg_to_tags(mut msg_output: MmsgOutput) -> anyhow::Result<[TagState; 9]> {
-    let monitor = msg_output.all_tags.pop().unwrap();
-
-    let tags = monitor.tags.map(|t| {
+pub fn mmsg_to_tags(msg_output: MmsgOutput) -> Vec<(String, [TagState; 9])> {
+    msg_output.all_tags.into_iter().map(|MonitorTags { monitor, tags }| {
+        let tags = tags.map(|t| {
             if t.is_active {
                 TagState::Selected
             } else if t.client_count > 0 {
@@ -37,8 +36,8 @@ pub fn mmsg_to_tags(mut msg_output: MmsgOutput) -> anyhow::Result<[TagState; 9]>
                 TagState::Empty
             }
         });
-
-    Ok(tags)
+        (monitor, tags)
+    }).collect()
 }
 
 pub fn poll_tags() -> anyhow::Result<MmsgOutput> {

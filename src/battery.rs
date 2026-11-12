@@ -17,7 +17,7 @@ pub enum Battery {
     None,
     Charging(Percentage),
     Discharging(Percentage),
-    Unknown(Percentage)
+    Unknown(Percentage),
 }
 
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
@@ -79,7 +79,12 @@ pub struct UeventSocket(OwnedFd);
 
 impl UeventSocket {
     pub fn new() -> anyhow::Result<Self> {
-        let fd = net::socket_with(net::AddressFamily::NETLINK, net::SocketType::DGRAM, net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK, Some(net::netlink::KOBJECT_UEVENT))?;
+        let fd = net::socket_with(
+            net::AddressFamily::NETLINK,
+            net::SocketType::DGRAM,
+            net::SocketFlags::CLOEXEC | net::SocketFlags::NONBLOCK,
+            Some(net::netlink::KOBJECT_UEVENT),
+        )?;
 
         let addr = net::netlink::SocketAddrNetlink::new(0, 1);
         net::bind(&fd, &addr)?;
