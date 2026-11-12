@@ -1,6 +1,5 @@
 use fontdue::Font;
 use std::collections::HashMap;
-use std::thread::JoinHandle;
 
 use crate::Bar;
 use crate::battery::{Battery, Percentage};
@@ -105,26 +104,23 @@ pub fn draw(
     }
 }
 
+/// A subset of Adwaita Sans with only the glyphs the bar can draw, built by
+/// the flake (`packages.<system>.font`). Embedded, so there's nothing to load
+/// at runtime, and small enough that fontdue parses it in well under 1ms.
+const FONT: &[u8] = include_bytes!(env!("ERTRAGBAR_FONT"));
+
 pub struct GlyphCache {
-    font_thread: Option<JoinHandle<Font>>,
-    font: Option<Font>,
+    font: Font,
     cache: HashMap<(char, u32), Glyph>,
 }
 
 impl GlyphCache {
-    pub fn new(font_thread: JoinHandle<Font>) -> Self {
+    pub fn new() -> Self {
         GlyphCache {
-            font_thread: Some(font_thread),
-            font: None,
+            font: Font::from_bytes(FONT, fontdue::FontSettings::default())
+                .expect("embedded font parses"),
             cache: HashMap::new(),
         }
-    }
-
-    fn font(&mut self) -> &Font {
-        if let Some(font_thread) = self.font_thread.take() {
-            self.font = Some(font_thread.join().expect("font loading thread panicked"));
-        }
-        self.font.as_ref().expect("font loaded")
     }
 
     /// Compute the physical layout for a bar `logical_width` wide at fractional
@@ -136,7 +132,7 @@ impl GlyphCache {
         let font_px = LOGICAL_FONT_PX as f32 * phys_height as f32 / LOGICAL_HEIGHT as f32;
 
         let lm = self
-            .font()
+            .font
             .horizontal_line_metrics(font_px)
             .expect("font has horizontal metrics");
         let baseline =
@@ -158,8 +154,7 @@ impl GlyphCache {
     }
 
     fn glyph(&mut self, ch: char, layout: &Layout) -> &Glyph {
-        self.font();
-        let font = self.font.as_ref().expect("font loaded");
+        let font = &self.font;
         // Keyed by exact size so outputs with different scales share one cache.
         self.cache
             .entry((ch, layout.font_px.to_bits()))
@@ -300,22 +295,59 @@ mod tests {
     use crate::time::Time;
 
     fn render(battery: Battery) -> Vec<u32> {
-        let mut gc = GlyphCache::new(std::thread::spawn(crate::load_font));
+        let mut gc = GlyphCache::new();
         let layout = gc.layout(120, 400);
-        let bar = Bar {
-            network: Network::WifiConnected,
-            battery,
-            time: Time {
-                year: 2026,
-                month: 1,
-                day: 1,
-                hour: 0,
-                minute: 0,
-            },
-        };
+        let bar = bar(Network::WifiConnected, battery);
         let mut buf = vec![0; (layout.phys_width * layout.phys_height) as usize];
         draw(&mut buf, &bar, &[TagState::Empty; 9], &layout, &mut gc);
         buf
+    }
+
+    fn bar(network: Network, battery: Battery) -> Bar {
+        let time = Time {
+            year: 2026,
+            month: 1,
+            day: 1,
+            hour: 0,
+            minute: 0,
+        };
+        Bar {
+            network,
+            battery,
+            time,
+        }
+    }
+
+    /// The font is a subset; a character missing from it would render as
+    /// nothing. Check everything the bar can print is in there.
+    #[test]
+    fn font_covers_all_text() {
+        let gc = GlyphCache::new();
+        let p = Percentage(100);
+        let batteries = [
+            Battery::Charging(p),
+            Battery::Discharging(p),
+            Battery::Unknown(p),
+        ];
+        let networks = [
+            Network::WifiConnected,
+            Network::WifiDisconnected,
+            Network::Ethernet,
+        ];
+        let mut text = String::from("0123456789"); // tag labels, all digits
+        text += SEPARATOR;
+        for n in networks {
+            for b in batteries {
+                for (s, _) in right_segments(&bar(n, b)) {
+                    text += &s;
+                }
+            }
+        }
+        let missing: String = text
+            .chars()
+            .filter(|&c| gc.font.lookup_glyph_index(c) == 0)
+            .collect();
+        assert!(missing.is_empty(), "not in font subset: {missing:?}");
     }
 
     #[test]

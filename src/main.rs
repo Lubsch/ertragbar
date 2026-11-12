@@ -1,6 +1,5 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
-use std::thread::JoinHandle;
 
 use rustix::{event, mm};
 use wayland_client::protocol::{
@@ -729,20 +728,7 @@ fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Path baked in at build time by the flake (package and dev shell), so the
-/// binary keeps a store reference to the font and it can't be GC'd.
-const FONT_PATH: &str = env!("ERTRAGBAR_FONT");
-
-fn load_font() -> fontdue::Font {
-    let font_file =
-        std::fs::read(FONT_PATH).unwrap_or_else(|e| panic!("reading font {FONT_PATH}: {e}"));
-    fontdue::Font::from_bytes(font_file.as_slice(), fontdue::FontSettings::default())
-        .unwrap_or_else(|e| panic!("parsing font {FONT_PATH}: {e}"))
-}
-
 fn main() -> anyhow::Result<()> {
-    let font_thread: JoinHandle<fontdue::Font> = std::thread::spawn(load_font);
-
     let conn = Connection::connect_to_env()?;
     let mut queue = conn.new_event_queue();
     let qh = queue.handle();
@@ -760,7 +746,7 @@ fn main() -> anyhow::Result<()> {
         seat_bound: false,
         monitors: vec![],
         tags: tags::poll_tags()?,
-        glyph_cache: GlyphCache::new(font_thread),
+        glyph_cache: GlyphCache::new(),
         bar: Bar {
             network: Network::WifiDisconnected,
             battery: Battery::None,
