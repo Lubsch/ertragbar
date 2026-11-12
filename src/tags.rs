@@ -26,18 +26,22 @@ struct Tag {
 }
 
 pub fn mmsg_to_tags(msg_output: MmsgOutput) -> Vec<(String, [TagState; 9])> {
-    msg_output.all_tags.into_iter().map(|MonitorTags { monitor, tags }| {
-        let tags = tags.map(|t| {
-            if t.is_active {
-                TagState::Selected
-            } else if t.client_count > 0 {
-                TagState::Occupied
-            } else {
-                TagState::Empty
-            }
-        });
-        (monitor, tags)
-    }).collect()
+    msg_output
+        .all_tags
+        .into_iter()
+        .map(|MonitorTags { monitor, tags }| {
+            let tags = tags.map(|t| {
+                if t.is_active {
+                    TagState::Selected
+                } else if t.client_count > 0 {
+                    TagState::Occupied
+                } else {
+                    TagState::Empty
+                }
+            });
+            (monitor, tags)
+        })
+        .collect()
 }
 
 pub fn poll_tags() -> anyhow::Result<MmsgOutput> {

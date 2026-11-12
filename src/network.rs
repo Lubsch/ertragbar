@@ -32,6 +32,13 @@ fn is_wireless(dir: &Path) -> bool {
     dir.join("wireless").exists() || dir.join("phy80211").exists()
 }
 
+/// Physical NICs (PCI, USB, SDIO, ...) have a `device` symlink pointing at
+/// their bus device. Virtual interfaces -- wireguard, tun/tap, bridges, veth,
+/// docker -- don't, so this keeps an always-on VPN from posing as ethernet.
+fn is_physical(dir: &Path) -> bool {
+    dir.join("device").exists()
+}
+
 /// carrier is 1 when the link has a physical/associated connection. Reading it
 /// on a down interface returns EINVAL, hence the Option.
 fn has_carrier(dir: &Path) -> bool {
@@ -104,7 +111,7 @@ pub fn read() -> Network {
         let Some(name) = dir.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if name == "lo" {
+        if name == "lo" || !is_physical(&dir) {
             continue;
         }
 
