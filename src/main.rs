@@ -1,8 +1,6 @@
-use std::io::BufRead;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::thread::JoinHandle;
 
-use nanoserde::DeJson;
 use rustix::{event, mm};
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
@@ -29,7 +27,11 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 
 use crate::render::{GlyphCache, Layout};
 use crate::{
-    battery::Battery, network::Network, render::LOGICAL_HEIGHT, tags::TagState, time::Time,
+    battery::Battery,
+    network::Network,
+    render::LOGICAL_HEIGHT,
+    tags::{TagSnapshot, TagState},
+    time::Time,
 };
 
 mod battery;
@@ -46,9 +48,6 @@ struct Bar {
     battery: Battery,
     time: Time,
 }
-
-/// Tag state per monitor name, as last reported by mmsg.
-type TagSnapshot = Vec<(String, [TagState; 9])>;
 
 const NO_TAGS: [TagState; 9] = [TagState::Empty; 9];
 
@@ -122,6 +121,13 @@ struct App {
 impl App {
     fn monitor(&mut self, global: u32) -> Option<&mut Monitor> {
         self.monitors.iter_mut().find(|m| m.global == global)
+    }
+
+    fn set_battery(&mut self, b: Battery) {
+        if b != self.bar.battery {
+            self.bar.battery = b;
+            self.mark_all_dirty();
+        }
     }
 
     fn mark_all_dirty(&mut self) {
@@ -565,12 +571,15 @@ fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Path baked in at build time by the flake (package and dev shell), so the
+/// binary keeps a store reference to the font and it can't be GC'd.
+const FONT_PATH: &str = env!("ERTRAGBAR_FONT");
+
 fn load_font() -> fontdue::Font {
-    // TODO Load font some proper way
-    let font_file = std::fs::read(
-        "/nix/store/l9lig0cpdxwyjmhx6yb2pr1lsx29rs78-adwaita-fonts-50.0/share/fonts/Adwaita/AdwaitaSans-Regular.ttf",
-    ).unwrap();
-    fontdue::Font::from_bytes(font_file.as_slice(), fontdue::FontSettings::default()).unwrap()
+    let font_file =
+        std::fs::read(FONT_PATH).unwrap_or_else(|e| panic!("reading font {FONT_PATH}: {e}"));
+    fontdue::Font::from_bytes(font_file.as_slice(), fontdue::FontSettings::default())
+        .unwrap_or_else(|e| panic!("parsing font {FONT_PATH}: {e}"))
 }
 
 fn main() -> anyhow::Result<()> {
@@ -588,7 +597,7 @@ fn main() -> anyhow::Result<()> {
         viewporter: None,
         shm: None,
         monitors: vec![],
-        tags: tags::mmsg_to_tags(tags::poll_tags()?),
+        tags: tags::poll_tags()?,
         glyph_cache: GlyphCache::new(font_thread),
         bar: Bar {
             network: Network::WifiDisconnected,
@@ -612,141 +621,95 @@ fn main() -> anyhow::Result<()> {
 
     // External event sources.
     let timer = crate::time::minute_timerfd()?;
-    let mut child = std::process::Command::new("mmsg")
-        .args(["watch", "all-tags"])
-        .stdout(std::process::Stdio::piped())
-        .spawn()?;
-    let stdout = child.stdout.take().unwrap();
-    let mut tags_rd = std::io::BufReader::new(stdout);
-    let tags_rd_raw = tags_rd.get_ref().as_raw_fd();
+    let mut tag_watcher = tags::TagWatcher::spawn()?;
     let battery_path = battery::battery_path();
     let uevent = battery::UeventSocket::new()?;
-    let uevent_fd = uevent.as_fd();
     let netlink = network::NetlinkSocket::new()?;
-    let netlink_fd = netlink.as_fd();
 
     // Initial state.
     app.bar.battery = battery::read(&battery_path);
     app.bar.network = network::read();
     app.mark_all_dirty();
 
-    // Reused so the hot path doesn't allocate a String per line.
-    let mut line = String::new();
+    loop {
+        queue.flush()?;
 
-    let mut run = || -> anyhow::Result<()> {
-        loop {
-            queue.flush()?;
-
-            // None means events are already queued: dispatch them instead of sleeping.
-            let Some(guard) = queue.prepare_read() else {
-                queue.dispatch_pending(&mut app)?;
-                app.create_pending_surfaces(&qh);
-                app.paint_dirty(&qh)?;
-                continue;
-            };
-
-            let mut fds = [
-                event::PollFd::new(&conn, event::PollFlags::IN),
-                event::PollFd::new(&timer, event::PollFlags::IN),
-                event::PollFd::from_borrowed_fd(
-                    unsafe { BorrowedFd::borrow_raw(tags_rd_raw) },
-                    event::PollFlags::IN,
-                ),
-                event::PollFd::new(&uevent_fd, event::PollFlags::IN),
-                event::PollFd::new(&netlink_fd, event::PollFlags::IN),
-            ];
-
-            event::poll(&mut fds, None)?;
-            let ready = |i: usize| fds[i].revents().contains(event::PollFlags::IN);
-            let (wl, tick, tags_in, uev, net) = (ready(0), ready(1), ready(2), ready(3), ready(4));
-
-            if wl {
-                guard.read()?;
-            } else {
-                drop(guard);
-            }
+        // None means events are already queued: dispatch them instead of sleeping.
+        let Some(guard) = queue.prepare_read() else {
             queue.dispatch_pending(&mut app)?;
             app.create_pending_surfaces(&qh);
-
-            if tick {
-                drain_timer(timer.as_fd())?;
-                while let Err(e) = crate::time::arm_next_minute(&timer) {
-                    eprintln!("Error setting timer: {e}");
-                }
-                let t = crate::time::poll_time()?;
-                if t != app.bar.time {
-                    app.bar.time = t;
-                    app.mark_all_dirty();
-                }
-
-                // Also read battery by the minute (there's no events emited when charging)
-                uevent.drain();
-                let b = battery::read(&battery_path);
-                if b != app.bar.battery {
-                    app.bar.battery = b;
-                    app.mark_all_dirty();
-                }
-            }
-
-            if tags_in {
-                // A tag switch can emit several lines at once. Drain everything
-                // buffered and keep only the last, so a burst costs one paint.
-                let mut latest: Option<TagSnapshot> = None;
-                loop {
-                    line.clear();
-                    match tags_rd.read_line(&mut line) {
-                        Ok(0) => anyhow::bail!("mmsg watch exited"),
-                        Ok(_) => {
-                            if let Ok(o) = tags::MmsgOutput::deserialize_json(&line) {
-                                latest = Some(tags::mmsg_to_tags(o));
-                            }
-                        }
-                        Err(e) => return Err(e.into()),
-                    }
-                    // Nothing more buffered: reading again would block.
-                    if tags_rd.buffer().is_empty() {
-                        break;
-                    }
-                }
-
-                if let Some(new) = latest {
-                    // Repaint only monitors whose tags actually changed.
-                    for m in &mut app.monitors {
-                        let Some(name) = &m.name else { continue };
-                        let lookup = |snap: &TagSnapshot| {
-                            snap.iter().find(|(n, _)| n == name).map(|(_, t)| *t)
-                        };
-                        if lookup(&app.tags) != lookup(&new) {
-                            m.dirty = true;
-                        }
-                    }
-                    app.tags = new;
-                }
-            }
-
-            if uev {
-                uevent.drain();
-                let b = battery::read(&battery_path);
-                if b != app.bar.battery {
-                    app.bar.battery = b;
-                    app.mark_all_dirty();
-                }
-            }
-
-            if net {
-                netlink.drain();
-                let n = network::read();
-                if n != app.bar.network {
-                    app.bar.network = n;
-                    app.mark_all_dirty();
-                }
-            }
-
             app.paint_dirty(&qh)?;
-        }
-    };
-    let result = run();
+            continue;
+        };
 
-    let _ = child.kill();
-    result
+        let mut fds = [
+            event::PollFd::new(&conn, event::PollFlags::IN),
+            event::PollFd::new(&timer, event::PollFlags::IN),
+            event::PollFd::from_borrowed_fd(tag_watcher.as_fd(), event::PollFlags::IN),
+            event::PollFd::from_borrowed_fd(uevent.as_fd(), event::PollFlags::IN),
+            event::PollFd::from_borrowed_fd(netlink.as_fd(), event::PollFlags::IN),
+        ];
+
+        event::poll(&mut fds, None)?;
+        // HUP too: an exited mmsg shows up as hangup, and read_latest reports it.
+        let ready = |i: usize| {
+            fds[i]
+                .revents()
+                .intersects(event::PollFlags::IN | event::PollFlags::HUP)
+        };
+        let (wl, tick, tags_in, uev, net) = (ready(0), ready(1), ready(2), ready(3), ready(4));
+
+        if wl {
+            guard.read()?;
+        } else {
+            drop(guard);
+        }
+        queue.dispatch_pending(&mut app)?;
+        app.create_pending_surfaces(&qh);
+
+        if tick {
+            drain_timer(timer.as_fd())?;
+            while let Err(e) = crate::time::arm_next_minute(&timer) {
+                eprintln!("Error setting timer: {e}");
+            }
+            let t = crate::time::poll_time()?;
+            if t != app.bar.time {
+                app.bar.time = t;
+                app.mark_all_dirty();
+            }
+
+            // Also read battery by the minute (there's no events emited when charging)
+            uevent.drain();
+            app.set_battery(battery::read(&battery_path));
+        }
+
+        if tags_in && let Some(new) = tag_watcher.read_latest()? {
+            // Repaint only monitors whose tags actually changed.
+            for m in &mut app.monitors {
+                let Some(name) = &m.name else { continue };
+                let lookup =
+                    |snap: &TagSnapshot| snap.iter().find(|(n, _)| n == name).map(|(_, t)| *t);
+                if lookup(&app.tags) != lookup(&new) {
+                    m.dirty = true;
+                }
+            }
+            app.tags = new;
+        }
+
+        if uev {
+            uevent.drain();
+            app.set_battery(battery::read(&battery_path));
+        }
+
+        if net {
+            netlink.drain();
+            let n = network::read();
+            if n != app.bar.network {
+                app.bar.network = n;
+                app.mark_all_dirty();
+            }
+        }
+
+        app.paint_dirty(&qh)?;
+    }
 }

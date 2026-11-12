@@ -20,7 +20,8 @@ pub enum Network {
     WifiDisconnected,
 }
 
-const NET: &str = "/sys/class/net";
+const SYS_NET: &str = "/sys/class/net";
+const PROC_NET: &str = "/proc/net";
 
 fn read_trimmed(p: &Path) -> Option<String> {
     std::fs::read_to_string(p).ok().map(|s| s.trim().to_owned())
@@ -48,10 +49,10 @@ fn has_carrier(dir: &Path) -> bool {
 /// Whether `iface` has a routable address: any non-loopback, non-link-local
 /// address. We read /proc rather than opening a netlink query, keeping this
 /// dependency-free and simple.
-fn has_routable_addr(iface: &str) -> bool {
+fn has_routable_addr(proc_net: &Path, iface: &str) -> bool {
     // IPv4: /proc/net/route lists per-interface routes. A default route or any
     // non-link-local route on this iface means DHCP/config completed.
-    if let Ok(routes) = std::fs::read_to_string("/proc/net/route") {
+    if let Ok(routes) = std::fs::read_to_string(proc_net.join("route")) {
         for line in routes.lines().skip(1) {
             let mut f = line.split_whitespace();
             let (Some(dev), Some(dest)) = (f.next(), f.next()) else {
@@ -79,7 +80,7 @@ fn has_routable_addr(iface: &str) -> bool {
 
     // IPv6: /proc/net/if_inet6 columns are addr, ifindex, prefixlen, scope,
     // flags, name. scope 0x00 is global.
-    if let Ok(v6) = std::fs::read_to_string("/proc/net/if_inet6") {
+    if let Ok(v6) = std::fs::read_to_string(proc_net.join("if_inet6")) {
         for line in v6.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
             if f.len() < 6 || f[5] != iface {
@@ -99,12 +100,16 @@ fn has_routable_addr(iface: &str) -> bool {
 /// should show regardless of wifi. Otherwise report wifi, connected only if it
 /// both has carrier and a routable address.
 pub fn read() -> Network {
-    let Ok(entries) = std::fs::read_dir(NET) else {
+    read_from(Path::new(SYS_NET), Path::new(PROC_NET))
+}
+
+/// [`read`] against arbitrary sysfs/procfs roots, for tests.
+fn read_from(sys_net: &Path, proc_net: &Path) -> Network {
+    let Ok(entries) = std::fs::read_dir(sys_net) else {
         return Network::WifiDisconnected;
     };
 
     let mut wifi_up = false;
-    let mut wifi_seen = false;
 
     for e in entries.flatten() {
         let dir = e.path();
@@ -116,11 +121,10 @@ pub fn read() -> Network {
         }
 
         if is_wireless(&dir) {
-            wifi_seen = true;
-            if has_carrier(&dir) && has_routable_addr(name) {
+            if has_carrier(&dir) && has_routable_addr(proc_net, name) {
                 wifi_up = true;
             }
-        } else if has_carrier(&dir) && has_routable_addr(name) {
+        } else if has_carrier(&dir) && has_routable_addr(proc_net, name) {
             // A wired interface that's actually usable.
             return Network::Ethernet;
         }
@@ -128,8 +132,6 @@ pub fn read() -> Network {
 
     if wifi_up {
         Network::WifiConnected
-    } else if wifi_seen {
-        Network::WifiDisconnected
     } else {
         Network::WifiDisconnected
     }
@@ -171,5 +173,82 @@ impl NetlinkSocket {
     /// Drain queued messages without parsing. True if anything arrived.
     pub fn drain(&self) -> bool {
         crate::socket::drain(self.0.as_fd())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+
+    /// Fake sysfs + procfs under a fresh temp dir.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(name: &str) -> Self {
+            let root =
+                std::env::temp_dir().join(format!("ertragbar-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(root.join("sys")).unwrap();
+            fs::create_dir_all(root.join("proc")).unwrap();
+            // Header line, then routes (Iface, Destination, ...).
+            fs::write(root.join("proc/route"), "Iface\tDestination\n").unwrap();
+            Fixture(root)
+        }
+
+        /// An interface with carrier and a default route.
+        fn iface(&self, name: &str, physical: bool, wireless: bool) -> &Self {
+            let dir = self.0.join("sys").join(name);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("carrier"), "1\n").unwrap();
+            if physical {
+                fs::create_dir(dir.join("device")).unwrap();
+            }
+            if wireless {
+                fs::create_dir(dir.join("wireless")).unwrap();
+            }
+            let mut routes = fs::read_to_string(self.0.join("proc/route")).unwrap();
+            routes += &format!("{name}\t00000000\n");
+            fs::write(self.0.join("proc/route"), routes).unwrap();
+            self
+        }
+
+        fn read(&self) -> Network {
+            read_from(&self.0.join("sys"), &self.0.join("proc"))
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn wifi_behind_wireguard() {
+        let f = Fixture::new("wg");
+        f.iface("wlan0", true, true).iface("wg0", false, false);
+        assert_eq!(f.read(), Network::WifiConnected);
+    }
+
+    #[test]
+    fn ethernet_wins_over_wifi() {
+        let f = Fixture::new("eth");
+        f.iface("wlan0", true, true).iface("enp0s31f6", true, false);
+        assert_eq!(f.read(), Network::Ethernet);
+    }
+
+    #[test]
+    fn link_local_only_is_disconnected() {
+        let f = Fixture::new("ll");
+        f.iface("wlan0", true, true);
+        // Replace the default route with a 169.254.0.0/16 one.
+        fs::write(
+            f.0.join("proc/route"),
+            "Iface\tDestination\nwlan0\t0000FEA9\n",
+        )
+        .unwrap();
+        assert_eq!(f.read(), Network::WifiDisconnected);
     }
 }

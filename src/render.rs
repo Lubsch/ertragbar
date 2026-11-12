@@ -15,6 +15,7 @@ const LOGICAL_PAD_X: i32 = 5; // left/right inner padding
 const BG: u32 = 0xff101010;
 const FG: u32 = 0xffebdbb2;
 const FG_DIM: u32 = 0xff101010; // empty tags
+const URGENT: u32 = 0xfffb4934;
 
 /// A rasterized glyph: coverage bitmap + placement metrics, all in physical px.
 #[derive(Debug)]
@@ -63,6 +64,7 @@ pub fn draw(
         let (square, text) = match tag {
             TagState::Empty => (BG, FG_DIM),
             TagState::Occupied => (BG, FG),
+            TagState::Urgent => (URGENT, BG),
             TagState::Selected => (FG, BG),
         };
 
@@ -219,9 +221,9 @@ impl GlyphCache {
 
 fn right_text(bar: &Bar) -> String {
     let net = match bar.network {
-        Network::WifiConnected => "Wifi",          // nf-fa-wifi
-        Network::WifiDisconnected => "No Wifi :(", // nf-md-wifi_off
-        Network::Ethernet => "Ethernet",           // nf-md-ethernet
+        Network::WifiConnected => "Wifi",
+        Network::WifiDisconnected => "No Wifi :(",
+        Network::Ethernet => "Ethernet",
     };
     let bat = match bar.battery {
         Battery::None => String::new(),

@@ -14,11 +14,19 @@ pub struct Time {
     pub minute: i32,
 }
 
+unsafe extern "C" {
+    // POSIX, but not exposed by the libc crate on unix.
+    fn tzset();
+}
+
 /// Current local wall-clock date and time
 pub fn poll_time() -> anyhow::Result<Time> {
     let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() as libc::time_t;
 
-    // let ts = libc::time_t::default();
+    // localtime_r doesn't reload the zone; tzset does (glibc re-stats
+    // /etc/localtime when TZ is unset), so a timezone change is picked up by
+    // the next minute tick instead of needing a restart.
+    unsafe { tzset() };
     let mut tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&secs, &mut tm) };
 
