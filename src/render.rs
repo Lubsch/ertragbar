@@ -15,7 +15,8 @@ const LOGICAL_PAD_X: i32 = 5; // left/right inner padding
 const BG: u32 = 0xff101010;
 const FG: u32 = 0xffebdbb2;
 const FG_DIM: u32 = 0xff101010; // empty tags
-const URGENT: u32 = 0xfffb4934;
+const URGENT: u32 = 0xfffb4934; // urgent tags, low battery
+const SEPARATOR: &str = "   ";
 
 /// A rasterized glyph: coverage bitmap + placement metrics, all in physical px.
 #[derive(Debug)]
@@ -79,11 +80,29 @@ pub fn draw(
         pen += side as f32; // squares touch; add a gap here if you want spacing
     }
 
-    // Right side: assemble the status string, right-align it.
-    let right = right_text(bar);
-    let text_w = gc.measure(&right, layout);
-    let start_x = (width as f32) - layout.pad_x as f32 - text_w;
-    gc.draw_text(&right, start_x, FG, buf, width, height, layout);
+    // Right side: status segments, right-aligned, separated by SEPARATOR.
+    let segments = right_segments(bar);
+    let sep_w = gc.measure(SEPARATOR, layout);
+    let widths: Vec<f32> = segments
+        .iter()
+        .map(|(t, _)| gc.measure(t, layout))
+        .collect();
+    let total = widths.iter().sum::<f32>() + sep_w * (segments.len() - 1) as f32;
+
+    let mut pen = (width as f32) - layout.pad_x as f32 - total;
+    for ((text, highlight), w) in segments.iter().zip(widths) {
+        let color = if *highlight {
+            // Full-height block, padded like the bar's edge padding.
+            let x0 = pen.round() as i32 - layout.pad_x;
+            let block_w = w.round() as i32 + 2 * layout.pad_x;
+            fill_rect(buf, (width, height), (x0, 0), (block_w, side), URGENT);
+            BG
+        } else {
+            FG
+        };
+        gc.draw_text(text, pen, color, buf, width, height, layout);
+        pen += w + sep_w;
+    }
 }
 
 pub struct GlyphCache {
@@ -219,18 +238,25 @@ impl GlyphCache {
     }
 }
 
-fn right_text(bar: &Bar) -> String {
+/// Status text, left to right, each with whether it gets the alert highlight.
+fn right_segments(bar: &Bar) -> Vec<(String, bool)> {
     let net = match bar.network {
         Network::WifiConnected => "Wifi",
         Network::WifiDisconnected => "No Wifi :(",
         Network::Ethernet => "Ethernet",
     };
+    let mut segments = vec![(net.to_owned(), false)];
+
     let bat = match bar.battery {
-        Battery::None => String::new(),
-        Battery::Charging(Percentage(p)) => format!("{p}% ▲   "),
-        Battery::Discharging(Percentage(p)) => format!("{p}% ▼   "),
-        Battery::Unknown(Percentage(p)) => format!("{p}% —   "),
+        Battery::None => None,
+        Battery::Charging(Percentage(p)) => Some(format!("{p}% ▲")),
+        Battery::Discharging(Percentage(p)) => Some(format!("{p}% ▼")),
+        Battery::Unknown(Percentage(p)) => Some(format!("{p}% —")),
     };
+    if let Some(bat) = bat {
+        segments.push((bat, bar.battery.is_low()));
+    }
+
     let crate::time::Time {
         year,
         month,
@@ -238,7 +264,11 @@ fn right_text(bar: &Bar) -> String {
         hour,
         minute,
     } = bar.time;
-    format!("{net}   {bat}{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+    segments.push((
+        format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}"),
+        false,
+    ));
+    segments
 }
 
 fn fill_rect(
@@ -261,5 +291,36 @@ fn fill_rect(
             }
             buf[base + px as usize] = color;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::time::Time;
+
+    fn render(battery: Battery) -> Vec<u32> {
+        let mut gc = GlyphCache::new(std::thread::spawn(crate::load_font));
+        let layout = gc.layout(120, 400);
+        let bar = Bar {
+            network: Network::WifiConnected,
+            battery,
+            time: Time {
+                year: 2026,
+                month: 1,
+                day: 1,
+                hour: 0,
+                minute: 0,
+            },
+        };
+        let mut buf = vec![0; (layout.phys_width * layout.phys_height) as usize];
+        draw(&mut buf, &bar, &[TagState::Empty; 9], &layout, &mut gc);
+        buf
+    }
+
+    #[test]
+    fn low_battery_is_highlighted() {
+        assert!(render(Battery::Discharging(Percentage(10))).contains(&URGENT));
+        assert!(!render(Battery::Discharging(Percentage(50))).contains(&URGENT));
     }
 }

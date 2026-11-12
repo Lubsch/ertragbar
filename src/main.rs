@@ -1,4 +1,5 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::process::{Child, Command, Stdio};
 use std::thread::JoinHandle;
 
 use rustix::{event, mm};
@@ -6,13 +7,19 @@ use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
     wl_output::{self, WlOutput},
+    wl_pointer::{self, WlPointer},
     wl_registry::{self, WlRegistry},
+    wl_seat::{self, WlSeat},
     wl_shm::{self, WlShm},
     wl_shm_pool::WlShmPool,
     wl_surface::WlSurface,
 };
-use wayland_client::{Connection, Dispatch, Proxy, QueueHandle};
+use wayland_client::{Connection, Dispatch, Proxy, QueueHandle, WEnum};
 
+use wayland_protocols::wp::cursor_shape::v1::client::{
+    wp_cursor_shape_device_v1::{self, WpCursorShapeDeviceV1},
+    wp_cursor_shape_manager_v1::WpCursorShapeManagerV1,
+};
 use wayland_protocols::wp::fractional_scale::v1::client::{
     wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1,
     wp_fractional_scale_v1::{self, WpFractionalScaleV1},
@@ -105,12 +112,37 @@ impl Drop for Monitor {
     }
 }
 
+/// The (first) seat's pointer, for clicking tags.
+struct Pointer {
+    pointer: WlPointer,
+    shape: Option<WpCursorShapeDeviceV1>,
+    /// Monitor global and surface-local x while the pointer is over a bar.
+    focus: Option<(u32, f64)>,
+}
+
+impl Drop for Pointer {
+    fn drop(&mut self) {
+        if let Some(s) = &self.shape {
+            s.destroy();
+        }
+        self.pointer.release();
+    }
+}
+
+/// linux/input-event-codes.h
+const BTN_LEFT: u32 = 0x110;
+
 struct App {
     compositor: Option<WlCompositor>,
     layer_shell: Option<ZwlrLayerShellV1>,
     fractional: Option<WpFractionalScaleManagerV1>,
     viewporter: Option<WpViewporter>,
     shm: Option<WlShm>,
+    cursor_shape: Option<WpCursorShapeManagerV1>,
+    pointer: Option<Pointer>,
+    /// `mmsg dispatch` processes from clicks, reaped in the main loop.
+    clicks: Vec<Child>,
+    seat_bound: bool,
 
     monitors: Vec<Monitor>,
     tags: TagSnapshot,
@@ -121,6 +153,37 @@ struct App {
 impl App {
     fn monitor(&mut self, global: u32) -> Option<&mut Monitor> {
         self.monitors.iter_mut().find(|m| m.global == global)
+    }
+
+    /// Left click on a bar: switch to the tag under the pointer. Acts on
+    /// mango's focused monitor, which follows the pointer onto this bar.
+    fn click(&mut self) {
+        let Some((global, x)) = self.pointer.as_ref().and_then(|p| p.focus) else {
+            return;
+        };
+        let Some(layout) = self.monitor(global).and_then(|m| m.layout) else {
+            return;
+        };
+        // Pointer coords are logical; tag squares are phys_height wide in
+        // buffer pixels.
+        let phys_x = x * layout.phys_width as f64 / layout.dest_width as f64;
+        let tag = (phys_x / layout.phys_height as f64) as usize;
+        if tag >= 9 {
+            return;
+        }
+        match Command::new("mmsg")
+            .args(["dispatch", &format!("view,{},0", tag + 1)])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+        {
+            Ok(child) => self.clicks.push(child),
+            Err(e) => eprintln!("ertragbar: spawning mmsg: {e}"),
+        }
+    }
+
+    fn reap_clicks(&mut self) {
+        self.clicks.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
     }
 
     fn set_battery(&mut self, b: Battery) {
@@ -432,6 +495,15 @@ impl Dispatch<WlRegistry, ()> for App {
                 "wp_viewporter" => {
                     state.viewporter = Some(registry.bind::<WpViewporter, _, _>(name, 1, qh, ()));
                 }
+                // One seat is plenty for a bar; extra seats are ignored.
+                "wl_seat" if !state.seat_bound => {
+                    state.seat_bound = true;
+                    registry.bind::<WlSeat, _, _>(name, version.min(5), qh, ());
+                }
+                "wp_cursor_shape_manager_v1" => {
+                    state.cursor_shape =
+                        Some(registry.bind::<WpCursorShapeManagerV1, _, _>(name, 1, qh, ()));
+                }
                 _ => {}
             },
             // Output unplugged: dropping the Monitor tears down its bar.
@@ -520,6 +592,90 @@ impl Dispatch<WpFractionalScaleV1, u32> for App {
     }
 }
 
+impl Dispatch<WlSeat, ()> for App {
+    fn event(
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wl_seat::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        let wl_seat::Event::Capabilities {
+            capabilities: WEnum::Value(caps),
+        } = event
+        else {
+            return;
+        };
+        let has_pointer = caps.contains(wl_seat::Capability::Pointer);
+        if has_pointer && state.pointer.is_none() {
+            state.pointer = Some(Pointer {
+                pointer: seat.get_pointer(qh, ()),
+                shape: None,
+                focus: None,
+            });
+        } else if !has_pointer {
+            state.pointer = None; // Drop releases it
+        }
+    }
+}
+
+impl Dispatch<WlPointer, ()> for App {
+    fn event(
+        state: &mut Self,
+        _: &WlPointer,
+        event: wl_pointer::Event,
+        _: &(),
+        _: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            wl_pointer::Event::Enter {
+                serial,
+                surface,
+                surface_x,
+                ..
+            } => {
+                let global = state
+                    .monitors
+                    .iter()
+                    .find(|m| m.bar_surface.as_ref().is_some_and(|b| b.surface == surface))
+                    .map(|m| m.global);
+                let Some(p) = state.pointer.as_mut() else {
+                    return;
+                };
+                p.focus = global.map(|g| (g, surface_x));
+                // Without this the cursor over the bar is whatever the
+                // compositor last drew, or nothing.
+                if p.shape.is_none()
+                    && let Some(mgr) = &state.cursor_shape
+                {
+                    p.shape = Some(mgr.get_pointer(&p.pointer, qh, ()));
+                }
+                if let Some(shape) = &p.shape {
+                    shape.set_shape(serial, wp_cursor_shape_device_v1::Shape::Default);
+                }
+            }
+            wl_pointer::Event::Leave { .. } => {
+                if let Some(p) = state.pointer.as_mut() {
+                    p.focus = None;
+                }
+            }
+            wl_pointer::Event::Motion { surface_x, .. } => {
+                if let Some((_, x)) = state.pointer.as_mut().and_then(|p| p.focus.as_mut()) {
+                    *x = surface_x;
+                }
+            }
+            wl_pointer::Event::Button {
+                button: BTN_LEFT,
+                state: WEnum::Value(wl_pointer::ButtonState::Pressed),
+                ..
+            } => state.click(),
+            _ => {}
+        }
+    }
+}
+
 /// User-data is (monitor global, slot index), so the handler clears `busy` in
 /// place. No Arc or atomics for state only this thread ever touches.
 impl Dispatch<WlBuffer, (u32, usize)> for App {
@@ -558,6 +714,8 @@ ignore!(
     WpFractionalScaleManagerV1,
     WpViewporter,
     WpViewport,
+    WpCursorShapeManagerV1,
+    WpCursorShapeDeviceV1,
 );
 
 /// Read the expiration count to clear readability. ECANCELED means the clock was
@@ -596,6 +754,10 @@ fn main() -> anyhow::Result<()> {
         fractional: None,
         viewporter: None,
         shm: None,
+        cursor_shape: None,
+        pointer: None,
+        clicks: vec![],
+        seat_bound: false,
         monitors: vec![],
         tags: tags::poll_tags()?,
         glyph_cache: GlyphCache::new(font_thread),
@@ -711,5 +873,6 @@ fn main() -> anyhow::Result<()> {
         }
 
         app.paint_dirty(&qh)?;
+        app.reap_clicks();
     }
 }

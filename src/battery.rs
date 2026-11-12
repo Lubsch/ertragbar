@@ -20,6 +20,15 @@ pub enum Battery {
     Unknown(Percentage),
 }
 
+/// At or below this while discharging, the bar highlights the battery.
+const LOW_PERCENT: u8 = 15;
+
+impl Battery {
+    pub fn is_low(self) -> bool {
+        matches!(self, Battery::Discharging(Percentage(p)) if p <= LOW_PERCENT)
+    }
+}
+
 const POWER_SUPPLY: &str = "/sys/class/power_supply";
 
 /// Find the first real battery. Power supplies also include AC adapters and
@@ -100,5 +109,18 @@ impl UeventSocket {
     /// least one arrived, i.e. something changed and state should be re-read.
     pub fn drain(&self) -> bool {
         crate::socket::drain(self.0.as_fd())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn low_only_while_discharging() {
+        assert!(Battery::Discharging(Percentage(15)).is_low());
+        assert!(!Battery::Discharging(Percentage(16)).is_low());
+        assert!(!Battery::Charging(Percentage(5)).is_low());
+        assert!(!Battery::None.is_low());
     }
 }
