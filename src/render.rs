@@ -14,7 +14,7 @@ const LOGICAL_PAD_X: i32 = 5; // left/right inner padding
 const BG: u32 = 0xff101010;
 const FG: u32 = 0xffebdbb2;
 const FG_DIM: u32 = 0xff101010; // empty tags
-const URGENT: u32 = 0xfffb4934; // urgent tags, low battery
+const URGENT: u32 = 0xffcc241d; // urgent tags, low battery
 const SEPARATOR: &str = "   ";
 
 /// A rasterized glyph: coverage bitmap + placement metrics, all in physical px.
@@ -64,7 +64,7 @@ pub fn draw(
         let (square, text) = match tag {
             TagState::Empty => (BG, FG_DIM),
             TagState::Occupied => (BG, FG),
-            TagState::Urgent => (URGENT, BG),
+            TagState::Urgent => (URGENT, FG),
             TagState::Selected => (FG, BG),
         };
 
