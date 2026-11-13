@@ -90,16 +90,13 @@ pub fn draw(
 
     let mut pen = (width as f32) - layout.pad_x as f32 - total;
     for ((text, highlight), w) in segments.iter().zip(widths) {
-        let color = if *highlight {
+        if *highlight {
             // Full-height block, padded like the bar's edge padding.
             let x0 = pen.round() as i32 - layout.pad_x;
             let block_w = w.round() as i32 + 2 * layout.pad_x;
             fill_rect(buf, (width, height), (x0, 0), (block_w, side), URGENT);
-            BG
-        } else {
-            FG
-        };
-        gc.draw_text(text, pen, color, buf, width, height, layout);
+        }
+        gc.draw_text(text, pen, FG, buf, width, height, layout);
         pen += w + sep_w;
     }
 }
