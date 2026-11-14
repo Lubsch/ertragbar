@@ -2,6 +2,7 @@ use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::process::{Child, Command, Stdio};
 
 use rustix::{event, mm};
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{
     wl_buffer::{self, WlBuffer},
     wl_compositor::WlCompositor,
@@ -717,6 +718,10 @@ ignore!(
     WpCursorShapeDeviceV1,
 );
 
+fn would_block(e: &WaylandError) -> bool {
+    matches!(e, WaylandError::Io(io) if io.kind() == std::io::ErrorKind::WouldBlock)
+}
+
 /// Read the expiration count to clear readability. ECANCELED means the clock was
 /// stepped (TFD_TIMER_CANCEL_ON_SET); we re-arm and repaint either way.
 fn drain_timer(fd: BorrowedFd<'_>) -> anyhow::Result<()> {
@@ -780,7 +785,14 @@ fn main() -> anyhow::Result<()> {
     app.mark_all_dirty();
 
     loop {
-        queue.flush()?;
+        // WouldBlock means the compositor isn't reading right now, e.g. while
+        // it reconfigures outputs after an unplug. Keep the rest buffered and
+        // poll for writability so it goes out once the compositor catches up.
+        let flush_pending = match queue.flush() {
+            Ok(()) => false,
+            Err(e) if would_block(&e) => true,
+            Err(e) => return Err(e.into()),
+        };
 
         // None means events are already queued: dispatch them instead of sleeping.
         let Some(guard) = queue.prepare_read() else {
@@ -791,14 +803,24 @@ fn main() -> anyhow::Result<()> {
         };
 
         let mut fds = [
-            event::PollFd::new(&conn, event::PollFlags::IN),
+            event::PollFd::new(
+                &conn,
+                if flush_pending {
+                    event::PollFlags::IN | event::PollFlags::OUT
+                } else {
+                    event::PollFlags::IN
+                },
+            ),
             event::PollFd::new(&timer, event::PollFlags::IN),
             event::PollFd::from_borrowed_fd(tag_watcher.as_fd(), event::PollFlags::IN),
             event::PollFd::from_borrowed_fd(uevent.as_fd(), event::PollFlags::IN),
             event::PollFd::from_borrowed_fd(netlink.as_fd(), event::PollFlags::IN),
         ];
 
-        event::poll(&mut fds, None)?;
+        match event::poll(&mut fds, None) {
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(e) => return Err(e.into()),
+        }
         // HUP too: an exited mmsg shows up as hangup, and read_latest reports it.
         let ready = |i: usize| {
             fds[i]
@@ -808,7 +830,12 @@ fn main() -> anyhow::Result<()> {
         let (wl, tick, tags_in, uev, net) = (ready(0), ready(1), ready(2), ready(3), ready(4));
 
         if wl {
-            guard.read()?;
+            // Readable but no complete message yet: nothing to dispatch.
+            match guard.read() {
+                Ok(_) => {}
+                Err(e) if would_block(&e) => {}
+                Err(e) => return Err(e.into()),
+            }
         } else {
             drop(guard);
         }
